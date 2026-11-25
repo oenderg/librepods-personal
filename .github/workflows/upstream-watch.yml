@@ -1,0 +1,79 @@
+name: Watch Upstream LibrePods
+
+on:
+  schedule:
+    # Daily at 08:00 UTC
+    - cron: '0 8 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+
+jobs:
+  check-upstream:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fetch upstream and sync mirror branches
+        id: sync
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git remote add upstream https://github.com/librepods-org/librepods.git
+          git fetch origin main android/rewrite || true
+          git fetch upstream main android/rewrite
+
+          REPORT=""
+          HAS_UPDATES="false"
+
+          for BRANCH in android/rewrite main; do
+            if git rev-parse --verify "origin/$BRANCH" >/dev/null 2>&1; then
+              BASE="origin/$BRANCH"
+              NEW_COMMITS=$(git log --no-merges --pretty=format:'- [`%h`](https://github.com/librepods-org/librepods/commit/%H) (%cs) %s' "$BASE..upstream/$BRANCH")
+            else
+              NEW_COMMITS=""
+            fi
+
+            if [ -n "$NEW_COMMITS" ]; then
+              HAS_UPDATES="true"
+              COUNT=$(git rev-list --count "$BASE..upstream/$BRANCH")
+              echo "Found $COUNT new commit(s) on upstream/$BRANCH"
+              git push origin "refs/remotes/upstream/$BRANCH:refs/heads/$BRANCH"
+              REPORT="${REPORT}### \`$BRANCH\` ($COUNT new commit(s))"$'\n'"${NEW_COMMITS}"$'\n\n'
+            elif ! git rev-parse --verify "origin/$BRANCH" >/dev/null 2>&1; then
+              echo "Initializing mirror branch origin/$BRANCH"
+              git push origin "refs/remotes/upstream/$BRANCH:refs/heads/$BRANCH"
+            else
+              echo "No new commits on upstream/$BRANCH"
+            fi
+          done
+
+          if [ "$HAS_UPDATES" = "true" ]; then
+            TITLE="Upstream sync: new commits in librepods-org/librepods"
+            BODY=$(cat <<EOF
+          New commits were detected in \`librepods-org/librepods\` and mirror branches have been fast-forwarded.
+
+          ${REPORT}---
+          To rebase \`fork\` onto the latest \`android/rewrite\`:
+          \`\`\`bash
+          git fetch origin
+          git checkout fork
+          git rebase origin/android/rewrite
+          \`\`\`
+          EOF
+          )
+
+            EXISTING=$(gh issue list --state open --search "\"$TITLE\" in:title" --json number,title --jq ".[] | select(.title == \"$TITLE\") | .number" | head -n 1)
+            if [ -n "$EXISTING" ]; then
+              gh issue comment "$EXISTING" --body "$BODY"
+              echo "Commented on existing tracking issue #$EXISTING"
+            else
+              gh issue create --title "$TITLE" --body "$BODY"
+              echo "Created new tracking issue"
+            fi
+          fi
