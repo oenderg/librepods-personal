@@ -64,7 +64,9 @@ class ShortcutActionActivity : Activity() {
                 val device = findKnownAppleDevice(service, mac)
                 if (device != null) {
                     Log.d(TAG, "Shortcut connecting to ${device.macAddress.toRedactedString()}")
-                    device.connect()
+                    CoroutineScope(Dispatchers.IO).launch {
+                        device.connect()
+                    }
                     Toast.makeText(this, R.string.connecting, Toast.LENGTH_SHORT).show()
                 } else if (mac != null) {
                     val svcIntent = Intent(this, LibrePodsService::class.java).apply {

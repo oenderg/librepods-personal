@@ -143,6 +143,19 @@ class AppleDevice(
             ConnectionState.CONNECTING
         }
 
+        // Proactively connect audio profiles (A2DP/HFP) in parallel with AACP so audio
+        // routing switches immediately instead of waiting ~5s for the OS to fetch SDP UUIDs.
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.CINNAMON_BUN) {
+            try {
+                bluetoothDevice.connect()
+            } catch (e: Exception) {
+                Log.w(TAG, "bluetoothDevice.connect() failed, falling back to connectAudio()", e)
+                connectAudio()
+            }
+        } else {
+            connectAudio()
+        }
+
         val success = aacp.connect() // && att.connect()
 
         CoroutineScope(Dispatchers.IO).launch {

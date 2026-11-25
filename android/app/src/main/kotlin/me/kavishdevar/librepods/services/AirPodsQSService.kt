@@ -339,7 +339,9 @@ class AirPodsQSService : TileService() {
         Log.d(TAG, "Tile clicked while disconnected; reconnecting to ${device.macAddress.toRedactedString()}.")
         reconnecting = true
         updateTile()
-        device.connect()
+        CoroutineScope(Dispatchers.IO).launch {
+            device.connect()
+        }
         handler.removeCallbacks(clearReconnecting)
         handler.postDelayed(clearReconnecting, RECONNECT_TIMEOUT_MS)
     }

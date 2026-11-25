@@ -138,7 +138,7 @@ object AppShortcutsManager {
                     .build()
             )
         } else {
-            appleDevices.take((maxCount - 1).coerceAtLeast(1)).forEach { dev ->
+            appleDevices.take(maxCount).forEach { dev ->
                 val mac = dev.macAddress.value
                 val name = dev.metadata.value.name.ifBlank { "AirPods" }
                 val shortLabel = if (appleDevices.size == 1) {
@@ -162,7 +162,6 @@ object AppShortcutsManager {
                         .build()
                 )
             }
-            shortcuts.add(toggleModeShortcut(context, rank = shortcuts.size))
         }
 
         val finalList = shortcuts.take(maxCount)
