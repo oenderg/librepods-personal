@@ -398,6 +398,7 @@ class AACPManager(private val device: AppleDevice) {
             MessageOpcode.AUDIO_SOURCE -> {
                 try {
                     val packet = AudioSourcePacket.parse(packet)
+                    Log.i(TAG, "Audio source: mac=${packet.audioSource.mac.toRedactedString()}, type=${packet.audioSource.type}")
 
                     device.updateState {
                         it.copy(
@@ -413,6 +414,7 @@ class AACPManager(private val device: AppleDevice) {
             MessageOpcode.CONNECTED_DEVICES -> {
                 try {
                     val packet = ConnectedDevicesPacket.parse(packet)
+                    Log.i(TAG, "Connected devices (${packet.connectedDevices.size}): ${packet.connectedDevices.joinToString { "${it.macAddress.toRedactedString()}(type=${it.type})" }}")
 
                     device.updateState {
                         it.copy (
@@ -793,13 +795,15 @@ class AACPManager(private val device: AppleDevice) {
         }
         Log.d(TAG, "Sending Media Information packet to $targetMac")
 
-        val buffer = ByteBuffer.allocate(138)
+        val stateStr = if (streamingState) "YES" else "NO"
+        val extra = if (streamingState) 1 else 0
+        val buffer = ByteBuffer.allocate(138 + extra)
         buffer.put(
             targetMac.value.split(":").map { it.toInt(16).toByte() }.toByteArray().reversedArray()
         )
         buffer.put(
             byteArrayOf(
-                0x82.toByte(), // related to the length
+                (0x82 + extra).toByte(), // related to the length
                 0x00
             )
         )
@@ -809,8 +813,8 @@ class AACPManager(private val device: AppleDevice) {
         buffer.put("com.google.ios.youtube".toByteArray()) // package name, hardcoding for now, aforementioned reason
         buffer.put(byteArrayOf(0x52)) // 'R'
         buffer.put("HostStreamingState".toByteArray())
-        buffer.put(byteArrayOf(0x42)) // 'B'
-        buffer.put((if (streamingState) "YES" else "NO").toByteArray()) // streaming state
+        buffer.put(byteArrayOf((0x40 + stateStr.length).toByte())) // 'B' (2) for NO, 'C' (3) for YES
+        buffer.put(stateStr.toByteArray()) // streaming state
         buffer.put(0x49) // 'I'
         buffer.put("btAddress".toByteArray()) // self MAC
         buffer.put(0x51) // 'Q'

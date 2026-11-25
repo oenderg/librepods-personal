@@ -26,7 +26,7 @@ data class AudioSourcePacket(
             }
 
             val payload = packet.copyOfRange(6, packet.size)
-            val macAddress = MacAddress(payload.sliceArray(0..5).toHexString(HexFormat{ upperCase = true }).chunked(2).joinToString(":"))
+            val macAddress = MacAddress(payload.sliceArray(0..5).reversedArray().toHexString(HexFormat{ upperCase = true }).chunked(2).joinToString(":"))
 
             val typeByte = payload[6]
             val type = AudioSourceType.fromByte(typeByte)
