@@ -34,6 +34,7 @@ import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
+import kotlinx.coroutines.delay
 import me.kavishdevar.librepods.R
 import me.kavishdevar.librepods.presentation.components.primitives.StyledInputField
 import me.kavishdevar.librepods.presentation.components.primitives.StyledScaffold
@@ -69,7 +70,10 @@ fun RenameScreen(
             val textFieldState = rememberTextFieldState(initialText = metadata.name)
 
             LaunchedEffect(textFieldState.text) {
-                viewModel.renameDevice(textFieldState.text.toString())
+                val newName = textFieldState.text.toString()
+                if (newName.isBlank() || newName == metadata.name) return@LaunchedEffect
+                delay(400)
+                viewModel.renameDevice(newName)
             }
 
             StyledInputField(

@@ -12,7 +12,14 @@ data class RenamePacket(
 
     override val opcode = MessageOpcode.RENAME
 
-    override val payload: ByteArray = byteArrayOf(0x01, name.length.toByte()) + name.toByteArray() + byteArrayOf(0x00)
+    override val payload: ByteArray = run {
+        val nameBytes = name.toByteArray(Charsets.UTF_8)
+        byteArrayOf(
+            0x01,
+            (nameBytes.size and 0xFF).toByte(),
+            ((nameBytes.size ushr 8) and 0xFF).toByte(),
+        ) + nameBytes
+    }
 
     companion object {
         fun create(
