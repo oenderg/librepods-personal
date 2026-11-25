@@ -76,6 +76,7 @@ import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.res.imageResource
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -577,6 +578,11 @@ fun NoiseControlSettings(
                     }
 
                     if (showLabels) {
+                        val labelStyle = if (currentMode == 4) {
+                            MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp)
+                        } else {
+                            MaterialTheme.typography.labelSmall
+                        }
                         Row (
                             modifier = Modifier
                                 .background(
@@ -588,36 +594,40 @@ fun NoiseControlSettings(
                             if (showOffListeningMode) {
                                 Text(
                                     text = stringResource(R.string.off),
-                                    style = MaterialTheme.typography.labelSmall,
+                                    style = labelStyle,
                                     textAlign = TextAlign.Center,
                                     modifier = Modifier.width(offWidth.dp),
                                     maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
                                     color = MaterialTheme.colorScheme.onSurface
                                 )
                             }
                             Text(
                                 text = stringResource(R.string.transparency),
-                                style = MaterialTheme.typography.labelSmall,
+                                style = labelStyle,
                                 textAlign = TextAlign.Center,
                                 modifier = Modifier.width(modeWidth.dp),
                                 maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
                                 color = MaterialTheme.colorScheme.onSurface
                             )
                             Text(
                                 text = stringResource(R.string.adaptive),
-                                style = MaterialTheme.typography.labelSmall,
+                                style = labelStyle,
                                 textAlign = TextAlign.Center,
                                 modifier = Modifier.width(adaptiveWidth.dp),
                                 maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
                                 color = MaterialTheme.colorScheme.onSurface
                             )
                             Text(
                                 text = stringResource(R.string.noise_cancellation),
-                                style = MaterialTheme.typography.labelSmall,
+                                style = labelStyle,
                                 textAlign = TextAlign.Center,
                                 modifier = Modifier.width(modeWidth.dp),
                                 minLines = 2,
                                 maxLines = 2,
+                                overflow = TextOverflow.Ellipsis,
                                 color = MaterialTheme.colorScheme.onSurface
                             )
                         }
