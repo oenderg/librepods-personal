@@ -98,6 +98,12 @@ private const val AUDIO_RELEASE_GRACE_MS = 3_000L
 
 @SuppressLint("MissingPermission")
 class LibrePodsService: Service() {
+    companion object {
+        @Volatile
+        var instance: LibrePodsService? = null
+            private set
+    }
+
     inner class LocalBinder : Binder() {
         fun getService(): LibrePodsService = this@LibrePodsService
     }
@@ -295,6 +301,7 @@ class LibrePodsService: Service() {
 
     override fun onCreate() {
         super.onCreate()
+        instance = this
 
         observeAppSettings()
 
@@ -377,6 +384,9 @@ class LibrePodsService: Service() {
     }
 
     override fun onDestroy() {
+        if (instance === this) {
+            instance = null
+        }
         unregisterBluetoothReceivers()
         closeAudioProfileProxies()
         bleManager.stop()
