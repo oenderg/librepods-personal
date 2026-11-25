@@ -465,8 +465,15 @@ class AACPManager(private val device: AppleDevice) {
             }
 
             MessageOpcode.CONNECTED_DEVICES -> {
+                if (packet.size < 9) return
                 try {
                     val packet = ConnectedDevicesPacket.parse(packet)
+                    val existingTypes = device.state.value.connectedDevices
+                        .mapNotNull { cd -> cd.type?.let { cd.macAddress.value to it } }
+                        .toMap()
+                    packet.connectedDevices.forEach { cd ->
+                        if (cd.type == null) cd.type = existingTypes[cd.macAddress.value]
+                    }
                     Log.i(TAG, "Connected devices (${packet.connectedDevices.size}): ${packet.connectedDevices.joinToString { "${it.macAddress.toRedactedString()}(type=${it.type})" }}")
 
                     device.updateState {
@@ -481,6 +488,7 @@ class AACPManager(private val device: AppleDevice) {
             }
 
             MessageOpcode.SMART_ROUTING_RESPONSE -> {
+                if (packet.size < 12) return
                 val packetString = packet.decodeToString()
                 val sender =
                     packet.sliceArray(6..11).reversedArray().joinToString(":") { "%02X".format(it) }
