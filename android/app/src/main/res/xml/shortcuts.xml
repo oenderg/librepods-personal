@@ -1,14 +1,4 @@
 <?xml version="1.0" encoding="utf-8"?>
 <shortcuts xmlns:android="http://schemas.android.com/apk/res/android">
-    <shortcut
-        android:shortcutId="toggle_listening_mode"
-        android:enabled="true"
-        android:icon="@drawable/ic_noise_cancellation"
-        android:shortcutShortLabel="@string/toggle_listening_mode"
-        android:shortcutLongLabel="@string/toggle_listening_mode">
-        <intent
-            android:action="android.intent.action.VIEW"
-            android:targetPackage="me.kavishdevar.librepods"
-            android:targetClass="me.kavishdevar.librepods.presentation.activities.ToggleListeningModeActivity" />
-    </shortcut>
+    <!-- Managed dynamically by AppShortcutsManager based on connected AirPods capabilities. -->
 </shortcuts>

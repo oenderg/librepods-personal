@@ -130,6 +130,15 @@
             android:noHistory="true"
             android:taskAffinity="" />
 
+        <activity
+            android:name=".presentation.activities.ShortcutActionActivity"
+            android:exported="true"
+            android:icon="@drawable/ic_airpods"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar"
+            android:excludeFromRecents="true"
+            android:noHistory="true"
+            android:taskAffinity="" />
+
         <service
             android:name=".services.LibrePodsService"
             android:enabled="true"

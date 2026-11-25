@@ -47,6 +47,8 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import me.kavishdevar.librepods.LibrePodsApplication
@@ -81,6 +83,7 @@ import me.kavishdevar.librepods.presentation.overlays.IslandType
 import me.kavishdevar.librepods.presentation.overlays.IslandWindow
 import me.kavishdevar.librepods.presentation.overlays.ProximityCardWindow
 import me.kavishdevar.librepods.presentation.widgets.BatteryWidget
+import me.kavishdevar.librepods.utils.AppShortcutsManager
 import me.kavishdevar.librepods.utils.MediaController
 import me.kavishdevar.librepods.utils.calculateLevel
 import java.time.ZoneOffset
@@ -311,6 +314,8 @@ class LibrePodsService: Service() {
 
         loadDevices()
 
+        observeDynamicShortcuts()
+
         bleManager.start()
 
         MediaController.initialize(
@@ -340,6 +345,25 @@ class LibrePodsService: Service() {
         }
 
         startForegroundNotification()
+    }
+
+    private fun observeDynamicShortcuts() {
+        serviceCoroutineScope.launch {
+            devices.collectLatest { devicesMap ->
+                val list = devicesMap.values.toList()
+                AppShortcutsManager.update(this@LibrePodsService, list)
+
+                val appleDevices = list.filterIsInstance<AppleDevice>()
+                if (appleDevices.isEmpty()) return@collectLatest
+
+                val flows = appleDevices.map { dev ->
+                    combine(dev.connectionState, dev.metadata) { conn, meta -> conn to meta }
+                }
+                combine(flows) { it }.collectLatest {
+                    AppShortcutsManager.update(this@LibrePodsService, list)
+                }
+            }
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
