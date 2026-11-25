@@ -466,4 +466,6 @@
     <string name="toggle_listening_mode">Toggle listening mode</string>
     <string name="listening_mode_shortcut">Listening mode shortcut</string>
     <string name="listening_mode_shortcut_description">The \"Toggle listening mode\" app shortcut switches between two listening modes. Add it from your launcher, an automation app, or a button mapping app.</string>
+    <string name="takeover_non_media_session_audio">Switch audio for games &amp; social apps</string>
+    <string name="takeover_non_media_session_audio_description">Automatically switch AirPods to this phone for games, Instagram/Reels, and browser audio without a media session.</string>
 </resources>

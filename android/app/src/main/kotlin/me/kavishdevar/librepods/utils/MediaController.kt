@@ -55,9 +55,13 @@ object MediaController {
         Log.d("MediaController", "Cleared pausedForOtherDevice after timeout, resuming normal playback monitoring")
     }
 
+    const val PREF_TAKEOVER_NON_MEDIA_SESSION_AUDIO = "takeover_non_media_session_audio"
+
     private var relativeVolume: Boolean = false
     private var conversationAwarenessVolume: Int = 2
     private var conversationAwarenessPauseMusic: Boolean = false
+    @Volatile
+    private var takeoverNonMediaSessionAudio: Boolean = false
 
     var recentlyLostOwnership: Boolean = false
 
@@ -70,9 +74,117 @@ object MediaController {
     private var musicPlayed: () -> Unit = {}
     private var musicStopped: () -> Unit = {}
 
+    private var sessionManager: android.media.session.MediaSessionManager? = null
+    private val trackedSessions = mutableMapOf<
+        android.media.session.MediaSession.Token,
+        Pair<android.media.session.MediaController, android.media.session.MediaController.Callback>
+    >()
+    private val playingSessionTokens = mutableSetOf<android.media.session.MediaSession.Token>()
+
+    private val activeSessionsListener =
+        android.media.session.MediaSessionManager.OnActiveSessionsChangedListener { controllers ->
+            syncTrackedMediaSessions(controllers.orEmpty(), isInitial = false)
+        }
+
+    private fun registerMediaSessionListener() {
+        val ctx = appContext ?: return
+        try {
+            val msm = ctx.getSystemService(android.media.session.MediaSessionManager::class.java) ?: return
+            val listener = android.content.ComponentName(
+                ctx,
+                me.kavishdevar.librepods.services.LibrePodsNotificationListener::class.java
+            )
+            sessionManager = msm
+            msm.addOnActiveSessionsChangedListener(activeSessionsListener, listener, handler)
+            syncTrackedMediaSessions(msm.getActiveSessions(listener), isInitial = true)
+        } catch (_: SecurityException) {
+            Log.d("MediaController", "NotificationListener not granted; skipping MediaSession listener")
+        } catch (e: Exception) {
+            Log.w("MediaController", "Failed to register MediaSession listener", e)
+        }
+    }
+
+    private fun syncTrackedMediaSessions(
+        controllers: List<android.media.session.MediaController>,
+        isInitial: Boolean
+    ) {
+        val currentTokens = controllers.map { it.sessionToken }.toSet()
+
+        // Unregister callbacks for sessions that disappeared
+        val removed = trackedSessions.keys - currentTokens
+        for (token in removed) {
+            trackedSessions.remove(token)?.let { (controller, callback) ->
+                try {
+                    controller.unregisterCallback(callback)
+                } catch (_: Exception) {
+                }
+            }
+            playingSessionTokens.remove(token)
+        }
+
+        // Register callbacks for new sessions
+        for (controller in controllers) {
+            val token = controller.sessionToken
+            val isPlayingNow = controller.playbackState?.state == android.media.session.PlaybackState.STATE_PLAYING
+            if (token !in trackedSessions) {
+                val callback = object : android.media.session.MediaController.Callback() {
+                    override fun onPlaybackStateChanged(state: android.media.session.PlaybackState?) {
+                        val playing = state?.state == android.media.session.PlaybackState.STATE_PLAYING
+                        handleMediaSessionStateChange(token, controller.packageName, playing)
+                    }
+                }
+                controller.registerCallback(callback, handler)
+                trackedSessions[token] = controller to callback
+                if (isPlayingNow) {
+                    if (isInitial) {
+                        playingSessionTokens.add(token)
+                    } else {
+                        handleMediaSessionStateChange(token, controller.packageName, true)
+                    }
+                }
+            }
+        }
+    }
+
+    private fun handleMediaSessionStateChange(
+        token: android.media.session.MediaSession.Token,
+        packageName: String?,
+        isPlaying: Boolean
+    ) {
+        val wasPlaying = token in playingSessionTokens
+        if (isPlaying) {
+            playingSessionTokens.add(token)
+        } else {
+            playingSessionTokens.remove(token)
+        }
+        if (isPlaying == wasPlaying) return
+
+        val now = SystemClock.uptimeMillis()
+        if (now - lastSelfActionAt < SELF_ACTION_IGNORE_MS) {
+            Log.d("MediaController", "Ignoring MediaSession state change ($packageName playing=$isPlaying) due to recent self-action")
+            return
+        }
+
+        if (isPlaying) {
+            Log.d("MediaController", "MediaSession transitioned to PLAYING ($packageName); pausedWhileTakingOver=$pausedWhileTakingOver, recentlyLostOwnership=$recentlyLostOwnership, lastKnownIsMusicActive=$lastKnownIsMusicActive")
+            if (!pausedWhileTakingOver && !recentlyLostOwnership && lastKnownIsMusicActive != true) {
+                handler.removeCallbacks(pendingSessionCheck)
+                handler.removeCallbacks(pendingSustainedMediaCheck)
+                pausedForOtherDevice = false
+                userPlayedTheMedia = true
+                lastKnownIsMusicActive = true
+                musicPlayed()
+            }
+        } else if (!takeoverNonMediaSessionAudio && playingSessionTokens.isEmpty() && lastKnownIsMusicActive == true) {
+            Log.d("MediaController", "All MediaSessions stopped/paused ($packageName); marking media inactive")
+            lastKnownIsMusicActive = false
+            musicStopped()
+        }
+    }
+
     private val pendingSessionCheck = Runnable {
         if (!pausedWhileTakingOver && !recentlyLostOwnership && lastKnownIsMusicActive != true &&
-            audioManager.isMusicActive && hasPlayingMediaSession()
+            audioManager.isMusicActive && queryPlayingMediaSession() == true
         ) {
             Log.d("MediaController", "Trailing MediaSession check confirmed active playback; requesting takeOver")
             handler.removeCallbacks(pendingSustainedMediaCheck)
@@ -82,6 +194,7 @@ object MediaController {
     }
 
     private val pendingSustainedMediaCheck = Runnable {
+        if (!takeoverNonMediaSessionAudio) return@Runnable
         val stillHasMedia = audioManager.activePlaybackConfigurations.any {
             it.audioAttributes?.usage == android.media.AudioAttributes.USAGE_MEDIA
         }
@@ -94,10 +207,14 @@ object MediaController {
         }
     }
 
-    private fun hasPlayingMediaSession(): Boolean {
-        val ctx = appContext ?: return false
+    /**
+     * Returns true if any active MediaSession is STATE_PLAYING, false if we can query sessions
+     * and none are playing, or null if NotificationListener access isn't granted.
+     */
+    private fun queryPlayingMediaSession(): Boolean? {
+        val ctx = appContext ?: return null
         return try {
-            val msm = ctx.getSystemService(android.media.session.MediaSessionManager::class.java) ?: return false
+            val msm = ctx.getSystemService(android.media.session.MediaSessionManager::class.java) ?: return null
             val listener = android.content.ComponentName(
                 ctx,
                 me.kavishdevar.librepods.services.LibrePodsNotificationListener::class.java
@@ -106,10 +223,10 @@ object MediaController {
                 it.playbackState?.state == android.media.session.PlaybackState.STATE_PLAYING
             }
         } catch (_: SecurityException) {
-            false
+            null
         } catch (e: Exception) {
             Log.w("MediaController", "couldn't query active media sessions", e)
-            false
+            null
         }
     }
 
@@ -167,6 +284,7 @@ object MediaController {
         relativeVolume = sharedPreferences.getBoolean("relative_conversation_awareness_volume", false)
         conversationAwarenessVolume = sharedPreferences.getInt("conversation_awareness_volume", (audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC) / 0.4).toInt())
         conversationAwarenessPauseMusic = sharedPreferences.getBoolean("conversation_awareness_pause_music", false)
+        takeoverNonMediaSessionAudio = sharedPreferences.getBoolean(PREF_TAKEOVER_NON_MEDIA_SESSION_AUDIO, false)
 
         preferenceChangeListener = SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
             when (key) {
@@ -179,12 +297,19 @@ object MediaController {
                 "conversation_awareness_pause_music" -> {
                     conversationAwarenessPauseMusic = sharedPreferences.getBoolean("conversation_awareness_pause_music", false)
                 }
+                PREF_TAKEOVER_NON_MEDIA_SESSION_AUDIO -> {
+                    takeoverNonMediaSessionAudio = sharedPreferences.getBoolean(PREF_TAKEOVER_NON_MEDIA_SESSION_AUDIO, false)
+                    if (!takeoverNonMediaSessionAudio) {
+                        handler.removeCallbacks(pendingSustainedMediaCheck)
+                    }
+                }
             }
         }
 
         sharedPreferences.registerOnSharedPreferenceChangeListener(preferenceChangeListener)
 
         audioManager.registerAudioPlaybackCallback(cb, null)
+        registerMediaSessionListener()
     }
 
     val cb = object : AudioManager.AudioPlaybackCallback() {
@@ -202,15 +327,21 @@ object MediaController {
                 return
             }
 
+            val playingSessionState = queryPlayingMediaSession()
             val hasNewMusicOrMoviePreview = configs?.any { config ->
                 val attrs = config.audioAttributes ?: return@any false
                 val ct = attrs.contentType
-                ct == android.media.AudioAttributes.CONTENT_TYPE_MUSIC ||
-                    ct == android.media.AudioAttributes.CONTENT_TYPE_MOVIE ||
-                    attrs.usage == android.media.AudioAttributes.USAGE_GAME ||
-                    (attrs.usage == android.media.AudioAttributes.USAGE_MEDIA &&
-                        ct == android.media.AudioAttributes.CONTENT_TYPE_UNKNOWN &&
-                        hasPlayingMediaSession())
+                val isMusicOrMovie = ct == android.media.AudioAttributes.CONTENT_TYPE_MUSIC ||
+                    ct == android.media.AudioAttributes.CONTENT_TYPE_MOVIE
+                val isUnknownMedia = attrs.usage == android.media.AudioAttributes.USAGE_MEDIA &&
+                    ct == android.media.AudioAttributes.CONTENT_TYPE_UNKNOWN
+                if (takeoverNonMediaSessionAudio || playingSessionState == null) {
+                    isMusicOrMovie ||
+                        (takeoverNonMediaSessionAudio && attrs.usage == android.media.AudioAttributes.USAGE_GAME) ||
+                        (isUnknownMedia && playingSessionState == true)
+                } else {
+                    (isMusicOrMovie || isUnknownMedia) && playingSessionState
+                }
             } == true
 
             if (now - lastPlaybackCallbackAt < PLAYBACK_DEBOUNCE_MS && !(isActive && hasNewMusicOrMoviePreview && lastKnownIsMusicActive != true)) {
@@ -245,7 +376,7 @@ object MediaController {
                 contentType == android.media.AudioAttributes.CONTENT_TYPE_MUSIC ||
                 contentType == android.media.AudioAttributes.CONTENT_TYPE_MOVIE
             }
-            val hasGameUsage = configs?.any { config ->
+            val hasGameUsage = takeoverNonMediaSessionAudio && configs?.any { config ->
                 config.audioAttributes?.usage == android.media.AudioAttributes.USAGE_GAME
             } == true
             val hasUnknownMediaUsage = configs?.any { config ->
@@ -253,17 +384,24 @@ object MediaController {
                 attrs?.usage == android.media.AudioAttributes.USAGE_MEDIA &&
                     attrs.contentType == android.media.AudioAttributes.CONTENT_TYPE_UNKNOWN
             } == true
-            val hasPlayingSession = hasUnknownMediaUsage && hasPlayingMediaSession()
-            val hasNewMusicOrMovie = hasMusicOrMovie || hasGameUsage || hasPlayingSession
+            val hasMediaTrack = hasMusicOrMovie || hasUnknownMediaUsage
+            val hasPlayingSession = hasMediaTrack && playingSessionState == true
+            val hasNewMusicOrMovie = if (takeoverNonMediaSessionAudio || playingSessionState == null) {
+                hasMusicOrMovie || hasGameUsage || hasPlayingSession
+            } else {
+                hasPlayingSession
+            }
 
             handler.removeCallbacks(pendingSessionCheck)
             handler.removeCallbacks(pendingSustainedMediaCheck)
-            if (hasUnknownMediaUsage && !hasNewMusicOrMovie && isActive && lastKnownIsMusicActive != true) {
+            if (hasMediaTrack && !hasNewMusicOrMovie && isActive && lastKnownIsMusicActive != true) {
                 handler.postDelayed(pendingSessionCheck, 200L)
-                handler.postDelayed(pendingSustainedMediaCheck, 1400L)
+                if (takeoverNonMediaSessionAudio && hasUnknownMediaUsage) {
+                    handler.postDelayed(pendingSustainedMediaCheck, 1400L)
+                }
             }
 
-            Log.d("MediaController", "Has new music or movie: $hasNewMusicOrMovie (musicOrMovie=$hasMusicOrMovie, game=$hasGameUsage, playingSession=$hasPlayingSession)")
+            Log.d("MediaController", "Has new music or movie: $hasNewMusicOrMovie (musicOrMovie=$hasMusicOrMovie, game=$hasGameUsage, playingSession=$hasPlayingSession, nonSessionEnabled=$takeoverNonMediaSessionAudio)")
 
             if (pausedForOtherDevice) {
                 handler.removeCallbacks(clearPausedForOtherDeviceRunnable)

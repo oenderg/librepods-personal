@@ -18,6 +18,7 @@
 
 package me.kavishdevar.librepods.presentation.screens.settings
 
+import android.content.Context
 import android.content.Intent
 import android.net.Uri
 import android.os.Build
@@ -79,6 +80,7 @@ import me.kavishdevar.librepods.presentation.components.primitives.styledListIte
 import me.kavishdevar.librepods.presentation.components.primitives.styledToggle
 import me.kavishdevar.librepods.presentation.icons.LocalIcons
 import me.kavishdevar.librepods.presentation.viewmodel.AppSettingsViewModel
+import me.kavishdevar.librepods.utils.MediaController
 import me.kavishdevar.librepods.utils.XposedState
 import java.util.concurrent.TimeUnit
 import kotlin.system.exitProcess
@@ -100,6 +102,14 @@ fun AppSettingsScreen(
     val context = LocalContext.current
     val scrollState = rememberScrollState()
     val state by viewModel.uiState.collectAsState()
+    val settingsPrefs = remember(context) {
+        context.getSharedPreferences("settings", Context.MODE_PRIVATE)
+    }
+    val takeoverNonMediaSessionAudio = remember(settingsPrefs) {
+        mutableStateOf(
+            settingsPrefs.getBoolean(MediaController.PREF_TAKEOVER_NON_MEDIA_SESSION_AUDIO, false)
+        )
+    }
 
     val backdrop = rememberLayerBackdrop()
 
@@ -197,6 +207,18 @@ fun AppSettingsScreen(
                             viewModel.updateSettings {
                                 it.copy(useHighestRefreshRate = checked)
                             }
+                        }
+                    )
+
+                    styledToggle(
+                        label = stringResource(R.string.takeover_non_media_session_audio),
+                        description = stringResource(R.string.takeover_non_media_session_audio_description),
+                        checked = takeoverNonMediaSessionAudio.value,
+                        onCheckedChange = { checked ->
+                            takeoverNonMediaSessionAudio.value = checked
+                            settingsPrefs.edit()
+                                .putBoolean(MediaController.PREF_TAKEOVER_NON_MEDIA_SESSION_AUDIO, checked)
+                                .apply()
                         }
                     )
                 }
