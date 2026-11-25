@@ -8,8 +8,11 @@ import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
 import android.appwidget.AppWidgetManager
+import android.bluetooth.BluetoothA2dp
 import android.bluetooth.BluetoothDevice
+import android.bluetooth.BluetoothHeadset
 import android.bluetooth.BluetoothManager
+import android.bluetooth.BluetoothProfile
 import android.bluetooth.le.ScanSettings
 import android.content.BroadcastReceiver
 import android.content.ComponentName
@@ -41,6 +44,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
@@ -80,11 +84,17 @@ import me.kavishdevar.librepods.presentation.widgets.BatteryWidget
 import me.kavishdevar.librepods.utils.MediaController
 import me.kavishdevar.librepods.utils.calculateLevel
 import java.time.ZoneOffset
+import java.util.Collections
+import java.util.concurrent.ConcurrentHashMap
 import kotlin.collections.getOrNull
 import kotlin.time.Duration
 import kotlin.time.toJavaInstant
 
 private const val TAG = "LibrePodsService"
+
+// A2DP and HFP disconnect within a few hundred ms of each other; wait this long
+// before deciding the user disconnected the device's audio.
+private const val AUDIO_RELEASE_GRACE_MS = 3_000L
 
 @SuppressLint("MissingPermission")
 class LibrePodsService: Service() {
@@ -154,6 +164,26 @@ class LibrePodsService: Service() {
     private val proximityCardWindow: ProximityCardWindow by lazy {
         (application as LibrePodsApplication).proximityCardWindow
     }
+
+    // Used to check whether this phone actually has a device's audio before
+    // LibrePods attaches to it in the background. While the AACP socket is open
+    // the Bluetooth link stays up, and the AirPods treat the phone as a connected
+    // host and bring A2DP/HFP back on their own.
+    @Volatile private var a2dpProxy: BluetoothA2dp? = null
+    @Volatile private var headsetProxy: BluetoothHeadset? = null
+
+    // Devices whose audio LibrePods itself dropped ("disconnect when not
+    // wearing"). Their AACP link is kept so ear detection can restore audio.
+    private val audioReleasedByLibrePods: MutableSet<MacAddress> =
+        Collections.synchronizedSet(mutableSetOf())
+
+    // Devices currently streaming to another host (e.g. Mac). We clear them as
+    // Android's active A2DP device so phone notifications / app launches don't
+    // steal audio, and restore them when the user starts media on this phone.
+    private val audioYieldedToOtherDevice: MutableSet<MacAddress> =
+        Collections.synchronizedSet(mutableSetOf())
+
+    private val pendingAudioReleaseChecks = ConcurrentHashMap<MacAddress, Job>()
 
     @Suppress("unused")
     private fun observeCameraState() {
@@ -270,6 +300,8 @@ class LibrePodsService: Service() {
 
         registerBluetoothReceivers()
 
+        registerAudioProfileProxies()
+
         loadDevices()
 
         bleManager.start()
@@ -277,9 +309,14 @@ class LibrePodsService: Service() {
         MediaController.initialize(
             audioManager = getSystemService(AudioManager::class.java),
             sharedPreferences = getSharedPreferences("settings", MODE_PRIVATE),
-            localMac = null, // TODO: smart routing. MAC_ADDRESS message gives host mac?,
+            localMac = getLocalBluetoothMac(),
+            context = this,
             musicPlayed = {
+                restoreYieldedAudioDevice()
                 attemptConnect("media")
+            },
+            musicStopped = {
+                notifyMediaStoppedToPeers()
             }
         )
 
@@ -341,6 +378,7 @@ class LibrePodsService: Service() {
 
     override fun onDestroy() {
         unregisterBluetoothReceivers()
+        closeAudioProfileProxies()
         bleManager.stop()
         serviceCoroutineScope.cancel("Service stopped")
         super.onDestroy()
@@ -358,6 +396,20 @@ class LibrePodsService: Service() {
 
         if (device == null) {
             Log.d(TAG, "Unsupported device connected: ${bluetoothDevice.address}")
+            return
+        }
+
+        // A link can come up without this phone having the audio: an SDP query,
+        // a brief page from the AirPods, or Android's own reconnect attempt.
+        // Attaching AACP then holds the link open and the AirPods move their
+        // audio here, taking it from whichever device was using them. Attach
+        // once A2DP or HFP is connected instead (see onAudioProfileStateChanged).
+        if (isAudioConnected(bluetoothDevice) != true) {
+            Log.i(
+                TAG,
+                "Not attaching to ${device.macAddress.toRedactedString()}: its audio isn't connected to this phone"
+            )
+            _devices.update { it + (device.macAddress to device) }
             return
         }
 
@@ -409,7 +461,115 @@ class LibrePodsService: Service() {
         _devices.update { it + (device.macAddress to device) }
     }
 
+    private fun getLocalBluetoothMac(): String? = try {
+        getSystemService(BluetoothManager::class.java)?.adapter?.address
+            ?.takeIf { it.isNotBlank() && it != "02:00:00:00:00:00" }
+    } catch (e: Exception) {
+        Log.w(TAG, "couldn't read local Bluetooth MAC", e)
+        null
+    }
+
+    private fun removeActiveAudioDevice() {
+        val adapter = getSystemService(BluetoothManager::class.java)?.adapter ?: return
+        try {
+            // BluetoothAdapter.ACTIVE_DEVICE_AUDIO = 0
+            val method = adapter.javaClass.getMethod("removeActiveDevice", Int::class.javaPrimitiveType)
+            val ok = method.invoke(adapter, 0) as? Boolean
+            Log.i(TAG, "removeActiveDevice(ACTIVE_DEVICE_AUDIO) -> $ok")
+        } catch (e: Exception) {
+            Log.w(TAG, "removeActiveDevice(ACTIVE_DEVICE_AUDIO) failed", e)
+        }
+    }
+
+    private fun setActiveAudioDevice(bluetoothDevice: BluetoothDevice) {
+        val adapter = getSystemService(BluetoothManager::class.java)?.adapter ?: return
+        try {
+            // BluetoothAdapter.ACTIVE_DEVICE_AUDIO = 0
+            val method = adapter.javaClass.getMethod(
+                "setActiveDevice",
+                BluetoothDevice::class.java,
+                Int::class.javaPrimitiveType
+            )
+            val ok = method.invoke(adapter, bluetoothDevice, 0) as? Boolean
+            Log.i(TAG, "setActiveDevice(${MacAddress(bluetoothDevice.address).toRedactedString()}, ACTIVE_DEVICE_AUDIO) -> $ok")
+        } catch (e: Exception) {
+            Log.w(TAG, "setActiveDevice(ACTIVE_DEVICE_AUDIO) failed", e)
+        }
+    }
+
+    private fun restoreYieldedAudioDevice() {
+        val localMac = getLocalBluetoothMac()
+        val connectedApple = devices.value.values
+            .filterIsInstance<AppleDevice>()
+            .firstOrNull { it.connectionState.value == ConnectionState.CONNECTED } ?: return
+
+        val wasYielded = audioYieldedToOtherDevice.remove(connectedApple.macAddress)
+        val hasOtherPeer = localMac != null &&
+            connectedApple.state.value.connectedDevices.any { !it.macAddress.value.equals(localMac, ignoreCase = true) }
+
+        // Always ensure the AirPods are active A2DP when intentional media starts
+        // on this phone (prevents getting stuck on speaker if state ever desyncs).
+        if (wasYielded || isAudioConnected(connectedApple.bluetoothDevice) == true) {
+            Log.i(TAG, "Phone started media playback; ensuring ${connectedApple.macAddress.toRedactedString()} is active A2DP device (wasYielded=$wasYielded)")
+            setActiveAudioDevice(connectedApple.bluetoothDevice)
+        }
+
+        if (localMac != null && hasOtherPeer) {
+            Log.i(TAG, "Smart Routing: claiming ownership & sending hijack request for ${connectedApple.macAddress.toRedactedString()}")
+            serviceCoroutineScope.launch {
+                connectedApple.aacp.sendControlCommand(ControlCommandIdentifier.OWNS_CONNECTION.value, 1)
+                connectedApple.aacp.sendMediaInformataion(localMac, streamingState = false)
+                if (wasYielded || !connectedApple.state.value.owns) {
+                    connectedApple.aacp.sendSmartRoutingShowUI(localMac)
+                    connectedApple.aacp.sendHijackRequest(localMac)
+                }
+            }
+        }
+    }
+
+    private fun notifyMediaStoppedToPeers() {
+        val localMac = getLocalBluetoothMac() ?: return
+        val connectedApple = devices.value.values
+            .filterIsInstance<AppleDevice>()
+            .firstOrNull {
+                it.connectionState.value == ConnectionState.CONNECTED &&
+                    it.state.value.connectedDevices.any { peer -> !peer.macAddress.value.equals(localMac, ignoreCase = true) }
+            } ?: return
+        Log.d(TAG, "Smart Routing: notifying peers that phone stopped streaming")
+        serviceCoroutineScope.launch {
+            connectedApple.aacp.sendMediaInformataion(localMac, streamingState = false)
+        }
+    }
+
+    private fun yieldOwnershipToOtherDevice(device: AppleDevice, reason: String) {
+        if (!audioYieldedToOtherDevice.add(device.macAddress)) {
+            Log.d(TAG, "Smart Routing: already yielded ${device.macAddress.toRedactedString()} ($reason)")
+            return
+        }
+        Log.i(TAG, "Smart Routing: yielding ${device.macAddress.toRedactedString()} ($reason)")
+        device.aacp.sendControlCommand(ControlCommandIdentifier.OWNS_CONNECTION.value, byteArrayOf(0x00))
+        MediaController.onOwnershipLost()
+        removeActiveAudioDevice()
+    }
+
+    private fun observeAppleEvents(device: AppleDevice) {
+        serviceCoroutineScope.launch {
+            device.events.collect { event ->
+                when (event) {
+                    is me.kavishdevar.librepods.core.bluetooth.aacp.types.AppleEvent.OwnershipToFalseRequest -> {
+                        yieldOwnershipToOtherDevice(
+                            device,
+                            "SetOwnershipToFalse from ${event.sender}, reverseTapped=${event.reverseTapped}"
+                        )
+                    }
+                    else -> {}
+                }
+            }
+        }
+    }
+
     private fun onDeviceDisconnected(mac: MacAddress) {
+        audioYieldedToOtherDevice.remove(mac)
         Log.i(TAG, "Device disconnected: $mac")
         val device = devices.value[mac]?: return
         device.disconnect()
@@ -462,6 +622,118 @@ class LibrePodsService: Service() {
                     )
 
                     BluetoothDevice.ACTION_UUID -> onDeviceConnected(bluetoothDevice)
+
+                    BluetoothA2dp.ACTION_CONNECTION_STATE_CHANGED,
+                    BluetoothHeadset.ACTION_CONNECTION_STATE_CHANGED -> onAudioProfileStateChanged(
+                        bluetoothDevice,
+                        intent.getIntExtra(BluetoothProfile.EXTRA_STATE, -1)
+                    )
+
+                    "android.bluetooth.a2dp.profile.action.ACTIVE_DEVICE_CHANGED" -> {
+                        // If the user manually selected the AirPods in Android's output switcher,
+                        // respect that and stop treating them as yielded.
+                        audioYieldedToOtherDevice.remove(MacAddress(bluetoothDevice.address))
+                    }
+                }
+            }
+        }
+    }
+
+    private val audioProfileListener = object : BluetoothProfile.ServiceListener {
+        override fun onServiceConnected(profile: Int, proxy: BluetoothProfile) {
+            when (profile) {
+                BluetoothProfile.A2DP -> a2dpProxy = proxy as BluetoothA2dp
+                BluetoothProfile.HEADSET -> headsetProxy = proxy as BluetoothHeadset
+                else -> return
+            }
+            // Devices loaded before both proxies were ready weren't attached.
+            if (a2dpProxy != null && headsetProxy != null) attachToDevicesWithAudio()
+        }
+
+        override fun onServiceDisconnected(profile: Int) {
+            when (profile) {
+                BluetoothProfile.A2DP -> a2dpProxy = null
+                BluetoothProfile.HEADSET -> headsetProxy = null
+            }
+        }
+    }
+
+    private fun registerAudioProfileProxies() {
+        val adapter = getSystemService(BluetoothManager::class.java).adapter ?: return
+        adapter.getProfileProxy(this, audioProfileListener, BluetoothProfile.A2DP)
+        adapter.getProfileProxy(this, audioProfileListener, BluetoothProfile.HEADSET)
+    }
+
+    private fun closeAudioProfileProxies() {
+        val adapter = getSystemService(BluetoothManager::class.java).adapter ?: return
+        a2dpProxy?.let { adapter.closeProfileProxy(BluetoothProfile.A2DP, it) }
+        headsetProxy?.let { adapter.closeProfileProxy(BluetoothProfile.HEADSET, it) }
+        a2dpProxy = null
+        headsetProxy = null
+    }
+
+    /**
+     * Whether A2DP or HFP to [bluetoothDevice] is connected (or connecting) on
+     * this phone, or null while the profile proxies aren't ready yet.
+     */
+    private fun isAudioConnected(bluetoothDevice: BluetoothDevice): Boolean? {
+        val a2dp = a2dpProxy ?: return null
+        val headset = headsetProxy ?: return null
+        fun BluetoothProfile.hasDevice(): Boolean = try {
+            getConnectionState(bluetoothDevice).let {
+                it == BluetoothProfile.STATE_CONNECTED || it == BluetoothProfile.STATE_CONNECTING
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "couldn't read profile state", e)
+            false
+        }
+        return a2dp.hasDevice() || headset.hasDevice()
+    }
+
+    private fun attachToDevicesWithAudio() {
+        val adapter = getSystemService(BluetoothManager::class.java).adapter ?: return
+        val aacpUuid = ParcelUuid.fromString("74ec2172-0bad-4d01-8f77-997b2be0722a")
+        adapter.bondedDevices
+            .filter { it.uuids?.contains(aacpUuid) == true && isAudioConnected(it) == true }
+            .forEach { onDeviceConnected(it) }
+    }
+
+    private fun onAudioProfileStateChanged(bluetoothDevice: BluetoothDevice, state: Int) {
+        val mac = MacAddress(bluetoothDevice.address)
+        when (state) {
+            BluetoothProfile.STATE_CONNECTED -> {
+                pendingAudioReleaseChecks.remove(mac)?.cancel()
+                if (mac in audioYieldedToOtherDevice) {
+                    Log.i(TAG, "Audio profile connected for ${mac.toRedactedString()} while yielded to another device; clearing active A2DP")
+                    removeActiveAudioDevice()
+                }
+                if (devices.value[mac]?.connectionState?.value == ConnectionState.CONNECTED) return
+                if (bluetoothDevice.uuids == null) {
+                    bluetoothDevice.fetchUuidsWithSdp()
+                } else {
+                    onDeviceConnected(bluetoothDevice)
+                }
+            }
+
+            BluetoothProfile.STATE_DISCONNECTED -> {
+                val device = devices.value[mac] as? AppleDevice ?: return
+                pendingAudioReleaseChecks.remove(mac)?.cancel()
+                pendingAudioReleaseChecks[mac] = serviceCoroutineScope.launch {
+                    delay(AUDIO_RELEASE_GRACE_MS)
+                    pendingAudioReleaseChecks.remove(mac)
+                    if (device.connectionState.value != ConnectionState.CONNECTED) return@launch
+                    if (mac in audioReleasedByLibrePods) {
+                        Log.d(TAG, "Audio for ${mac.toRedactedString()} was released by LibrePods; keeping AACP for ear detection")
+                        return@launch
+                    }
+                    if (isAudioConnected(bluetoothDevice) != false) return@launch
+                    // The user (or another app) disconnected the device on this
+                    // phone. Close AACP too, or the link stays up and the AirPods
+                    // reconnect their audio here, taking it from the device that
+                    // is using them.
+                    Log.i(TAG, "Audio for ${mac.toRedactedString()} was disconnected outside LibrePods; closing AACP to release the link")
+                    device.disconnect()
+                    updateDeviceNotification(device = device)
                 }
             }
         }
@@ -472,6 +744,9 @@ class LibrePodsService: Service() {
             addAction("android.bluetooth.device.action.ACL_CONNECTED")
             addAction("android.bluetooth.device.action.ACL_DISCONNECTED")
             addAction("android.bluetooth.device.action.UUID")
+            addAction(BluetoothA2dp.ACTION_CONNECTION_STATE_CHANGED)
+            addAction(BluetoothHeadset.ACTION_CONNECTION_STATE_CHANGED)
+            addAction("android.bluetooth.a2dp.profile.action.ACTIVE_DEVICE_CHANGED")
         }
 
         registerReceiver(bluetoothReceiver, intentFilter, RECEIVER_EXPORTED)
@@ -500,7 +775,13 @@ class LibrePodsService: Service() {
                     context = this,
                     bluetoothAdapter = bluetoothAdapter,
                     bluetoothDevice = bluetoothDevice,
-                    currentState = if (isConnectedMethod.invoke(bluetoothDevice) as Boolean) ConnectionState.AVAILABLE else ConnectionState.DISCONNECTED
+                    // AVAILABLE makes AppleDevice attach AACP right away, so
+                    // also require this phone to have the device's audio (see
+                    // onDeviceConnected).
+                    currentState = if (
+                        isConnectedMethod.invoke(bluetoothDevice) as Boolean &&
+                        isAudioConnected(bluetoothDevice) == true
+                    ) ConnectionState.AVAILABLE else ConnectionState.DISCONNECTED
                 )
             }
 
@@ -556,6 +837,7 @@ class LibrePodsService: Service() {
                 }
 
                 observeAppleState(device)
+                observeAppleEvents(device)
                 observeAppleSettings(device)
                 observeAppleMetadata(device)
                 observeAppleMicrophoneFrames(device)
@@ -577,9 +859,13 @@ class LibrePodsService: Service() {
                     when (device) {
                         is AppleDevice -> {
                             val settings = device.settings.value
-                            val state = device.state.value
-                            if (settings.alwaysConnectWhenAccessoryDisconnected && System.currentTimeMillis() - state.lastDisconnected > 5_000) {
-                                Log.i(TAG, "device ${device.macAddress.toRedactedString()} is nearby, connecting")
+                            val appleState = device.state.value
+                            if (
+                                settings.alwaysConnectWhenAccessoryDisconnected &&
+                                appleState.state == AccessoryState.Disconnected &&
+                                System.currentTimeMillis() - appleState.lastDisconnected > 5_000
+                            ) {
+                                Log.i(TAG, "device ${device.macAddress.toRedactedString()} is nearby and disconnected, connecting")
                                 device.connect()
                             }
                         }
@@ -622,6 +908,53 @@ class LibrePodsService: Service() {
                     }
                     if (appDataRepository.state.value.firstSuccessfulConnectionTime == null) {
                         appDataRepository.updateState { it.copy(firstSuccessfulConnectionTime = System.currentTimeMillis()) }
+                    }
+                }
+
+                if (state.connectedDevices != previousState.connectedDevices) {
+                    val localMac = getLocalBluetoothMac()
+                    if (localMac != null) {
+                        val previousMacs = previousState.connectedDevices.map { it.macAddress.value.uppercase() }.toSet()
+                        val newPeers = state.connectedDevices.filter {
+                            !it.macAddress.value.equals(localMac, ignoreCase = true) &&
+                                it.macAddress.value.uppercase() !in previousMacs
+                        }
+                        for (peer in newPeers) {
+                            Log.i(TAG, "Smart Routing: registering TiPi/MediaInfo with new peer ${peer.macAddress.toRedactedString()}")
+                            device.aacp.sendMediaInformationNewDevice(localMac, peer.macAddress.value)
+                            device.aacp.sendAddTiPiDevice(localMac, peer.macAddress.value)
+                        }
+                    }
+                }
+
+                if (state.owns != previousState.owns && !state.owns) {
+                    yieldOwnershipToOtherDevice(device, "OWNS_CONNECTION -> false")
+                }
+
+                if (state.audioSource != previousState.audioSource) {
+                    val src = state.audioSource
+                    val localMac = getLocalBluetoothMac()
+                    if (
+                        src != null &&
+                        src.type != me.kavishdevar.librepods.core.bluetooth.aacp.types.AudioSourceType.NONE &&
+                        src.mac.value != "00:00:00:00:00:00" &&
+                        localMac != null &&
+                        !src.mac.value.equals(localMac, ignoreCase = true)
+                    ) {
+                        if (audioYieldedToOtherDevice.add(device.macAddress)) {
+                            Log.i(
+                                TAG,
+                                "Another device (${src.mac.toRedactedString()}, ${src.type}) is using ${device.macAddress.toRedactedString()}; clearing active A2DP device on this phone"
+                            )
+                            removeActiveAudioDevice()
+                        }
+                    } else if (
+                        src != null &&
+                        src.type != me.kavishdevar.librepods.core.bluetooth.aacp.types.AudioSourceType.NONE &&
+                        localMac != null &&
+                        src.mac.value.equals(localMac, ignoreCase = true)
+                    ) {
+                        audioYieldedToOtherDevice.remove(device.macAddress)
                     }
                 }
 
@@ -1316,6 +1649,7 @@ class LibrePodsService: Service() {
                     TAG,
                     "User put in at least one component, enabling audio for device ${device.macAddress.toRedactedString()}"
                 )
+                audioReleasedByLibrePods.remove(device.macAddress)
                 device.enableAudio()
                 device.connectA2dp()
                 justEnabledA2dp = true
@@ -1341,6 +1675,7 @@ class LibrePodsService: Service() {
                         TAG,
                         "Disconnecting audio for device ${device.macAddress.toRedactedString()} because user took out all components and disconnectWhenNotWearing is true"
                     )
+                    audioReleasedByLibrePods.add(device.macAddress)
                     device.disableAudio()
                     device.disconnectAudio()
                 }

@@ -65,17 +65,104 @@ object MediaController {
     private var lastPlayTime: Long = 0L
 
     private var localMac: String? = null
+    private var appContext: android.content.Context? = null
 
     private var musicPlayed: () -> Unit = {}
+    private var musicStopped: () -> Unit = {}
 
-    fun initialize(audioManager: AudioManager, sharedPreferences: SharedPreferences, localMac: String?, musicPlayed: () -> Unit) {
+    private val pendingSessionCheck = Runnable {
+        if (!pausedWhileTakingOver && !recentlyLostOwnership && lastKnownIsMusicActive != true &&
+            audioManager.isMusicActive && hasPlayingMediaSession()
+        ) {
+            Log.d("MediaController", "Trailing MediaSession check confirmed active playback; requesting takeOver")
+            handler.removeCallbacks(pendingSustainedMediaCheck)
+            lastKnownIsMusicActive = true
+            musicPlayed()
+        }
+    }
+
+    private val pendingSustainedMediaCheck = Runnable {
+        val stillHasMedia = audioManager.activePlaybackConfigurations.any {
+            it.audioAttributes?.usage == android.media.AudioAttributes.USAGE_MEDIA
+        }
+        if (!pausedWhileTakingOver && !recentlyLostOwnership && lastKnownIsMusicActive != true &&
+            audioManager.isMusicActive && stillHasMedia
+        ) {
+            Log.d("MediaController", "Sustained USAGE_MEDIA check (1.4s) confirmed active playback (e.g. Instagram/browser); requesting takeOver")
+            lastKnownIsMusicActive = true
+            musicPlayed()
+        }
+    }
+
+    private fun hasPlayingMediaSession(): Boolean {
+        val ctx = appContext ?: return false
+        return try {
+            val msm = ctx.getSystemService(android.media.session.MediaSessionManager::class.java) ?: return false
+            val listener = android.content.ComponentName(
+                ctx,
+                me.kavishdevar.librepods.services.LibrePodsNotificationListener::class.java
+            )
+            msm.getActiveSessions(listener).any {
+                it.playbackState?.state == android.media.session.PlaybackState.STATE_PLAYING
+            }
+        } catch (_: SecurityException) {
+            false
+        } catch (e: Exception) {
+            Log.w("MediaController", "couldn't query active media sessions", e)
+            false
+        }
+    }
+
+    fun onOwnershipLost() {
+        handler.removeCallbacks(pendingSessionCheck)
+        handler.removeCallbacks(pendingSustainedMediaCheck)
+        recentlyLostOwnership = true
+        lastKnownIsMusicActive = false
+        handler.postDelayed({ recentlyLostOwnership = false }, 1500L)
+        // Pause any actively playing MediaSession directly (more reliable than KEYCODE_MEDIA_PAUSE)
+        val ctx = appContext
+        var pausedViaSession = false
+        if (ctx != null) {
+            try {
+                val msm = ctx.getSystemService(android.media.session.MediaSessionManager::class.java)
+                val listener = android.content.ComponentName(
+                    ctx,
+                    me.kavishdevar.librepods.services.LibrePodsNotificationListener::class.java
+                )
+                msm?.getActiveSessions(listener)?.forEach { controller ->
+                    if (controller.playbackState?.state == android.media.session.PlaybackState.STATE_PLAYING) {
+                        controller.transportControls.pause()
+                        pausedViaSession = true
+                    }
+                }
+            } catch (_: SecurityException) {
+            } catch (e: Exception) {
+                Log.w("MediaController", "couldn't pause via MediaSession", e)
+            }
+        }
+        if (!pausedViaSession) {
+            sendPause(force = true)
+        }
+        iPausedTheMedia = false
+    }
+
+    fun initialize(
+        audioManager: AudioManager,
+        sharedPreferences: SharedPreferences,
+        localMac: String?,
+        context: android.content.Context? = null,
+        musicPlayed: () -> Unit,
+        musicStopped: () -> Unit = {}
+    ) {
         this.localMac = localMac
+        if (context != null) this.appContext = context.applicationContext
         if (this::audioManager.isInitialized) {
             return
         }
         this.audioManager = audioManager
         this.sharedPreferences = sharedPreferences
-        this.musicPlayed = MediaController.musicPlayed
+        this.musicPlayed = musicPlayed
+        this.musicStopped = musicStopped
         Log.d("MediaController", "Initializing MediaController")
         relativeVolume = sharedPreferences.getBoolean("relative_conversation_awareness_volume", false)
         conversationAwarenessVolume = sharedPreferences.getInt("conversation_awareness_volume", (audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC) / 0.4).toInt())
@@ -115,7 +202,18 @@ object MediaController {
                 return
             }
 
-            if (now - lastPlaybackCallbackAt < PLAYBACK_DEBOUNCE_MS) {
+            val hasNewMusicOrMoviePreview = configs?.any { config ->
+                val attrs = config.audioAttributes ?: return@any false
+                val ct = attrs.contentType
+                ct == android.media.AudioAttributes.CONTENT_TYPE_MUSIC ||
+                    ct == android.media.AudioAttributes.CONTENT_TYPE_MOVIE ||
+                    attrs.usage == android.media.AudioAttributes.USAGE_GAME ||
+                    (attrs.usage == android.media.AudioAttributes.USAGE_MEDIA &&
+                        ct == android.media.AudioAttributes.CONTENT_TYPE_UNKNOWN &&
+                        hasPlayingMediaSession())
+            } == true
+
+            if (now - lastPlaybackCallbackAt < PLAYBACK_DEBOUNCE_MS && !(isActive && hasNewMusicOrMoviePreview && lastKnownIsMusicActive != true)) {
                 Log.d("MediaController", "Ignoring playback callback due to debounce (${now - lastPlaybackCallbackAt}ms)")
                 lastPlaybackCallbackAt = now
                 return
@@ -143,12 +241,29 @@ object MediaController {
 
             Log.d("MediaController", "Current active content types: $currentActiveContentTypes")
 
-            val hasNewMusicOrMovie = currentActiveContentTypes.any { contentType ->
+            val hasMusicOrMovie = currentActiveContentTypes.any { contentType ->
                 contentType == android.media.AudioAttributes.CONTENT_TYPE_MUSIC ||
                 contentType == android.media.AudioAttributes.CONTENT_TYPE_MOVIE
             }
+            val hasGameUsage = configs?.any { config ->
+                config.audioAttributes?.usage == android.media.AudioAttributes.USAGE_GAME
+            } == true
+            val hasUnknownMediaUsage = configs?.any { config ->
+                val attrs = config.audioAttributes
+                attrs?.usage == android.media.AudioAttributes.USAGE_MEDIA &&
+                    attrs.contentType == android.media.AudioAttributes.CONTENT_TYPE_UNKNOWN
+            } == true
+            val hasPlayingSession = hasUnknownMediaUsage && hasPlayingMediaSession()
+            val hasNewMusicOrMovie = hasMusicOrMovie || hasGameUsage || hasPlayingSession
 
-            Log.d("MediaController", "Has new music or movie: $hasNewMusicOrMovie")
+            handler.removeCallbacks(pendingSessionCheck)
+            handler.removeCallbacks(pendingSustainedMediaCheck)
+            if (hasUnknownMediaUsage && !hasNewMusicOrMovie && isActive && lastKnownIsMusicActive != true) {
+                handler.postDelayed(pendingSessionCheck, 200L)
+                handler.postDelayed(pendingSustainedMediaCheck, 1400L)
+            }
+
+            Log.d("MediaController", "Has new music or movie: $hasNewMusicOrMovie (musicOrMovie=$hasMusicOrMovie, game=$hasGameUsage, playingSession=$hasPlayingSession)")
 
             if (pausedForOtherDevice) {
                 handler.removeCallbacks(clearPausedForOtherDeviceRunnable)
@@ -176,11 +291,12 @@ object MediaController {
             }
 
             if (configs != null && !iPausedTheMedia) {
-                if (localMac.isNullOrBlank()) return
-//                ServiceManager.getService()?.aacpManager?.sendMediaInformataion(
-//                    localMac,
-//                    isActive
-//                )
+//                if (!localMac.isNullOrBlank()) {
+//                    ServiceManager.getService()?.aacpManager?.sendMediaInformataion(
+//                        localMac,
+//                        isActive
+//                    )
+//                }
                 Log.d("MediaController", "User changed media state themselves; will wait for ear detection pause before auto-play")
                 handler.postDelayed({
                     userPlayedTheMedia = audioManager.isMusicActive
@@ -204,7 +320,11 @@ object MediaController {
                 }
             }
 
-            lastKnownIsMusicActive = hasNewMusicOrMovie && isActive
+            val nowActiveMedia = hasNewMusicOrMovie && isActive
+            if (lastKnownIsMusicActive == true && !nowActiveMedia) {
+                musicStopped()
+            }
+            lastKnownIsMusicActive = nowActiveMedia
         }
     }
 
