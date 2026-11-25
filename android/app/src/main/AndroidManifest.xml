@@ -121,6 +121,15 @@
             android:name=".presentation.activities.NoiseControlWidgetConfigurationActivity"
             android:exported="false" />
 
+        <activity
+            android:name=".presentation.activities.ToggleListeningModeActivity"
+            android:exported="true"
+            android:icon="@drawable/ic_noise_cancellation"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar"
+            android:excludeFromRecents="true"
+            android:noHistory="true"
+            android:taskAffinity="" />
+
         <service
             android:name=".services.LibrePodsService"
             android:enabled="true"

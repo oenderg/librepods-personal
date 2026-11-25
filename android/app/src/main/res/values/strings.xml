@@ -463,4 +463,7 @@
     <string name="show_close_button">Show close button</string>
     <string name="angular_velocity">Angular velocity</string>
     <string name="test_head_gestures">Test Head Gestures</string>
+    <string name="toggle_listening_mode">Toggle listening mode</string>
+    <string name="listening_mode_shortcut">Listening mode shortcut</string>
+    <string name="listening_mode_shortcut_description">The \"Toggle listening mode\" app shortcut switches between two listening modes. Add it from your launcher, an automation app, or a button mapping app.</string>
 </resources>

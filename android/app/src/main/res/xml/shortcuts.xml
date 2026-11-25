@@ -1,13 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
 <shortcuts xmlns:android="http://schemas.android.com/apk/res/android">
-<!--    <shortcut-->
-<!--        android:shortcutId="test"-->
-<!--        android:enabled="true"-->
-<!--        android:icon="@drawable/ic_smartphone"-->
-<!--        android:shortcutShortLabel="@string/test">-->
-
-<!--        <intent-->
-<!--            android:action="android.intent.action.VIEW"-->
-<!--            android:targetPackage="me.kavishdevar.librepods"-->
-<!--            android:targetClass="me.kavishdevar.librepods.presentation.activities.TestActivity" />-->
-<!--    </shortcut>-->
+    <shortcut
+        android:shortcutId="toggle_listening_mode"
+        android:enabled="true"
+        android:icon="@drawable/ic_noise_cancellation"
+        android:shortcutShortLabel="@string/toggle_listening_mode"
+        android:shortcutLongLabel="@string/toggle_listening_mode">
+        <intent
+            android:action="android.intent.action.VIEW"
+            android:targetPackage="me.kavishdevar.librepods"
+            android:targetClass="me.kavishdevar.librepods.presentation.activities.ToggleListeningModeActivity" />
+    </shortcut>
 </shortcuts>
