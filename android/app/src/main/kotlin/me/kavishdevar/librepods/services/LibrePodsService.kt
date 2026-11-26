@@ -194,6 +194,20 @@ class LibrePodsService: Service() {
 
     private val pendingAudioReleaseChecks = ConcurrentHashMap<MacAddress, Job>()
 
+    // Devices whose A2DP/HFP profile is disconnecting externally (outside
+    // LibrePods's "disconnect when not wearing"). Prevents ear-detection from
+    // re-enabling audio and fighting a manual disconnect during the grace window.
+    private val audioDisconnectingDevices: MutableSet<MacAddress> =
+        Collections.synchronizedSet(mutableSetOf())
+
+    private val pendingA2dpReceivers = ConcurrentHashMap<MacAddress, BroadcastReceiver>()
+
+    private fun cancelPendingA2dpReceiver(mac: MacAddress) {
+        pendingA2dpReceivers.remove(mac)?.let { receiver ->
+            runCatching { unregisterReceiver(receiver) }
+        }
+    }
+
     @Suppress("unused")
     private fun observeCameraState() {
         CoroutineScope(Dispatchers.IO).launch {
@@ -411,9 +425,14 @@ class LibrePodsService: Service() {
         if (instance === this) {
             instance = null
         }
-        unregisterBluetoothReceivers()
+        pendingAudioReleaseChecks.values.forEach { it.cancel() }
+        pendingAudioReleaseChecks.clear()
+        pendingA2dpReceivers.keys.toList().forEach { cancelPendingA2dpReceiver(it) }
+        audioDisconnectingDevices.clear()
+        runCatching { unregisterBluetoothReceivers() }
         closeAudioProfileProxies()
         bleManager.stop()
+        devices.value.values.filterIsInstance<AppleDevice>().forEach { it.closeAacp() }
         serviceCoroutineScope.cancel("Service stopped")
         super.onDestroy()
     }
@@ -604,6 +623,10 @@ class LibrePodsService: Service() {
 
     private fun onDeviceDisconnected(mac: MacAddress) {
         audioYieldedToOtherDevice.remove(mac)
+        audioDisconnectingDevices.remove(mac)
+        audioReleasedByLibrePods.remove(mac)
+        pendingAudioReleaseChecks.remove(mac)?.cancel()
+        cancelPendingA2dpReceiver(mac)
         Log.i(TAG, "Device disconnected: $mac")
         val device = devices.value[mac]?: return
         device.disconnect()
@@ -736,6 +759,7 @@ class LibrePodsService: Service() {
         val mac = MacAddress(bluetoothDevice.address)
         when (state) {
             BluetoothProfile.STATE_CONNECTED -> {
+                audioDisconnectingDevices.remove(mac)
                 pendingAudioReleaseChecks.remove(mac)?.cancel()
                 if (mac in audioYieldedToOtherDevice) {
                     Log.i(TAG, "Audio profile connected for ${mac.toRedactedString()} while yielded to another device; clearing active A2DP")
@@ -749,25 +773,40 @@ class LibrePodsService: Service() {
                 }
             }
 
+            BluetoothProfile.STATE_DISCONNECTING -> {
+                if (mac !in audioReleasedByLibrePods) {
+                    audioDisconnectingDevices.add(mac)
+                    cancelPendingA2dpReceiver(mac)
+                }
+            }
+
             BluetoothProfile.STATE_DISCONNECTED -> {
                 val device = devices.value[mac] as? AppleDevice ?: return
+                if (mac !in audioReleasedByLibrePods) {
+                    audioDisconnectingDevices.add(mac)
+                    cancelPendingA2dpReceiver(mac)
+                }
                 pendingAudioReleaseChecks.remove(mac)?.cancel()
                 pendingAudioReleaseChecks[mac] = serviceCoroutineScope.launch {
-                    delay(AUDIO_RELEASE_GRACE_MS)
-                    pendingAudioReleaseChecks.remove(mac)
-                    if (device.connectionState.value != ConnectionState.CONNECTED) return@launch
-                    if (mac in audioReleasedByLibrePods) {
-                        Log.d(TAG, "Audio for ${mac.toRedactedString()} was released by LibrePods; keeping AACP for ear detection")
-                        return@launch
+                    try {
+                        delay(AUDIO_RELEASE_GRACE_MS)
+                        pendingAudioReleaseChecks.remove(mac)
+                        if (device.connectionState.value != ConnectionState.CONNECTED) return@launch
+                        if (mac in audioReleasedByLibrePods) {
+                            Log.d(TAG, "Audio for ${mac.toRedactedString()} was released by LibrePods; keeping AACP for ear detection")
+                            return@launch
+                        }
+                        if (isAudioConnected(bluetoothDevice) != false) return@launch
+                        // The user (or another app) disconnected the device on this
+                        // phone. Close AACP too, or the link stays up and the AirPods
+                        // reconnect their audio here, taking it from the device that
+                        // is using them.
+                        Log.i(TAG, "Audio for ${mac.toRedactedString()} was disconnected outside LibrePods; closing AACP to release the link")
+                        device.disconnect()
+                        updateDeviceNotification(device = device)
+                    } finally {
+                        audioDisconnectingDevices.remove(mac)
                     }
-                    if (isAudioConnected(bluetoothDevice) != false) return@launch
-                    // The user (or another app) disconnected the device on this
-                    // phone. Close AACP too, or the link stays up and the AirPods
-                    // reconnect their audio here, taking it from the device that
-                    // is using them.
-                    Log.i(TAG, "Audio for ${mac.toRedactedString()} was disconnected outside LibrePods; closing AACP to release the link")
-                    device.disconnect()
-                    updateDeviceNotification(device = device)
                 }
             }
         }
@@ -1682,30 +1721,40 @@ class LibrePodsService: Service() {
 
         when {
             old == EarPresence.NONE -> {
-                Log.d(
-                    TAG,
-                    "User put in at least one component, enabling audio for device ${device.macAddress.toRedactedString()}"
-                )
-                audioReleasedByLibrePods.remove(device.macAddress)
-                device.enableAudio()
-                device.connectA2dp()
-                justEnabledA2dp = true
+                if (device.macAddress in audioDisconnectingDevices || pendingAudioReleaseChecks.containsKey(device.macAddress)) {
+                    Log.d(
+                        TAG,
+                        "Audio for ${device.macAddress.toRedactedString()} is disconnecting externally; skipping ear-detection audio reconnect"
+                    )
+                } else {
+                    Log.d(
+                        TAG,
+                        "User put in at least one component, enabling audio for device ${device.macAddress.toRedactedString()}"
+                    )
+                    audioReleasedByLibrePods.remove(device.macAddress)
+                    device.enableAudio()
+                    device.connectA2dp()
+                    justEnabledA2dp = true
 
-                device.waitForA2dpConnection(this) {
-                    MediaController.sendPlay()
-                    MediaController.iPausedTheMedia = false
-                }
+                    cancelPendingA2dpReceiver(device.macAddress)
+                    pendingA2dpReceivers[device.macAddress] = device.waitForA2dpConnection(this) {
+                        pendingA2dpReceivers.remove(device.macAddress)
+                        MediaController.sendPlay()
+                        MediaController.iPausedTheMedia = false
+                    }
 
-                if (MediaController.getMusicActive()) {
-                    MediaController.userPlayedTheMedia = true
-                }
-                if (new == EarPresence.PARTIAL) {
-                    MediaController.sendPlay()
-                    MediaController.iPausedTheMedia = false
+                    if (MediaController.getMusicActive()) {
+                        MediaController.userPlayedTheMedia = true
+                    }
+                    if (new == EarPresence.PARTIAL) {
+                        MediaController.sendPlay()
+                        MediaController.iPausedTheMedia = false
+                    }
                 }
             }
 
             new == EarPresence.NONE -> {
+                cancelPendingA2dpReceiver(device.macAddress)
                 MediaController.sendPause(force = true)
                 if (disconnectWhenNotWearing) {
                     Log.d(

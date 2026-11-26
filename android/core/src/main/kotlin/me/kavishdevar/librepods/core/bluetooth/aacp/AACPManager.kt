@@ -72,10 +72,14 @@ class AACPManager(private val device: AppleDevice) {
     private val macParts = device.macAddress.value.split(":")
     private val TAG = "AACPManager[${macParts[0]}:${macParts[1]}:${macParts[2]}]"
 
+    @Volatile
     private var socket: BluetoothSocket? = null
+    private val connectionLock = Any()
 
     private var readerJob: Job? = null
     private var initJob: Job? = null
+
+    fun isConnected(): Boolean = socket?.isConnected == true
 
     private val rtBuddyManager = RTBuddyManager(::sendPacket)
 
@@ -123,79 +127,92 @@ class AACPManager(private val device: AppleDevice) {
 
     fun setHeartRateEnabled(enabled: Boolean): Boolean = heartRateSession?.setEnabled(enabled) ?: false
 
-    private suspend fun sendDelayedInitPackets() {
-        socket?.let {
-            while (!it.isConnected) {
-                Log.i(TAG, "waiting for connection...")
-                delay(500.milliseconds)
-            }
-            Log.i(TAG, "initializing connection")
-
-            connectService4()
-            delay(200.milliseconds)
-            sendSourceFeatureCapabilities()
-            delay(200.milliseconds)
-            sendNotificationRequest()
-            delay(200.milliseconds)
-            sendCountryCode()
-            delay(200.milliseconds)
-            sendRequestMagicKeys((MagicKeyType.IRK.value + MagicKeyType.ENC_KEY.value).toByte())
-            delay(200.milliseconds)
-            heartRateSession?.requestDescriptors()
-        } ?: run {
-            Log.e(TAG, "socket is null after creation")
+    private suspend fun sendDelayedInitPackets(expected: BluetoothSocket) {
+        while (socket === expected && !expected.isConnected) {
+            Log.i(TAG, "waiting for connection...")
+            delay(500.milliseconds)
         }
+        if (socket !== expected || !expected.isConnected) return
+
+        Log.i(TAG, "initializing connection")
+
+        connectService4()
+        delay(200.milliseconds)
+        if (socket !== expected || !expected.isConnected) return
+        sendSourceFeatureCapabilities()
+        delay(200.milliseconds)
+        if (socket !== expected || !expected.isConnected) return
+        sendNotificationRequest()
+        delay(200.milliseconds)
+        if (socket !== expected || !expected.isConnected) return
+        sendCountryCode()
+        delay(200.milliseconds)
+        if (socket !== expected || !expected.isConnected) return
+        sendRequestMagicKeys((MagicKeyType.IRK.value + MagicKeyType.ENC_KEY.value).toByte())
+        delay(200.milliseconds)
+        if (socket !== expected || !expected.isConnected) return
+        heartRateSession?.requestDescriptors()
     }
 
     fun connect(): Boolean {
-        if (socket != null && socket!!.isConnected) {
+        if (socket?.isConnected == true) {
             Log.i(TAG, "Already connected")
             return true
         }
-        try {
-            socket = device.createSocket(ParcelUuid.fromString("74ec2172-0bad-4d01-8f77-997b2be0722a"),  4097)
+        val newSocket = try {
+            device.createSocket(ParcelUuid.fromString("74ec2172-0bad-4d01-8f77-997b2be0722a"), 4097)
         } catch (e: Exception) {
             Log.e(TAG, "failed to create socket", e)
             return false
         }
 
-        socket?.let { socket ->
-            try {
-                Log.i(TAG, "connecting...")
-                socket.connect()
-            } catch (e: Exception) {
-                Log.e(TAG, "failed to connect", e)
-                return false
-            }
+        try {
+            Log.i(TAG, "connecting...")
+            newSocket.connect()
+        } catch (e: Exception) {
+            Log.e(TAG, "failed to connect", e)
+            runCatching { newSocket.close() }
+            return false
+        }
 
-            if (socket.isConnected) {
-                Log.i(TAG, "connected!")
+        if (!newSocket.isConnected) {
+            Log.w(TAG, "socket not connected after connect()")
+            runCatching { newSocket.close() }
+            return false
+        }
+
+        Log.i(TAG, "connected!")
+
+        synchronized(connectionLock) {
+            // Cancel any jobs and close any socket left over from a previous session.
+            initJob?.cancel()
+            readerJob?.cancel()
+            val previousSocket = socket
+            socket = newSocket
+            if (previousSocket != null && previousSocket !== newSocket) {
+                runCatching { previousSocket.close() }
             }
 
             sensorFrames.reset()
             heartRateSession?.close()
-            heartRateSession = createHeartRateSession(socket)
+            heartRateSession = createHeartRateSession(newSocket)
 
-            initJob?.cancel()
             initJob = CoroutineScope(Dispatchers.IO).launch {
-                sendDelayedInitPackets()
+                sendDelayedInitPackets(newSocket)
                 delay(3.seconds) // just android stuff ig
-                sendDelayedInitPackets()
+                sendDelayedInitPackets(newSocket)
             }
 
-            // Cancel any reader left over from a previous socket before starting a new one,
-            // otherwise every reconnect leaks another reader against a dead socket.
-            readerJob?.cancel()
             readerJob = CoroutineScope(Dispatchers.IO).launch {
                 Log.i(TAG, "starting to read data...")
 
                 try {
-                    while (socket.isConnected) {
+                    while (socket === newSocket && newSocket.isConnected) {
                         // Sensor descriptor announcements are larger than 1 KiB.
                         val buffer = ByteArray(65_535)
 
                         val bytesRead = try {
-                            socket.inputStream.read(buffer)
+                            newSocket.inputStream.read(buffer)
                         } catch (e: IOException) {
                             // A failed read on a Bluetooth socket is terminal. Retrying it spins
                             // this coroutine at 100% CPU and floods the log, because the loop
@@ -224,12 +241,32 @@ class AACPManager(private val device: AppleDevice) {
                     }
                 } finally {
                     Log.i(TAG, "stopped reading data")
+                    handleUnexpectedDisconnect(newSocket)
                 }
             }
-        } ?: run {
-            Log.e(TAG, "socket is null after creation")
         }
         return true
+    }
+
+    private fun handleUnexpectedDisconnect(closedSocket: BluetoothSocket) {
+        val wasCurrent = synchronized(connectionLock) {
+            if (socket !== closedSocket) {
+                false
+            } else {
+                socket = null
+                initJob?.cancel()
+                initJob = null
+                readerJob = null
+                heartRateSession?.close()
+                heartRateSession = null
+                sensorFrames.reset()
+                true
+            }
+        }
+        if (wasCurrent) {
+            runCatching { closedSocket.close() }
+            device.onAacpSocketClosed()
+        }
     }
 
     fun sendRawPacket(data: ByteArray): Boolean {
@@ -1093,20 +1130,24 @@ class AACPManager(private val device: AppleDevice) {
     }
 
     fun disconnect() {
-        readerJob?.cancel()
-        readerJob = null
-        initJob?.cancel()
-        initJob = null
+        val activeSocket = synchronized(connectionLock) {
+            readerJob?.cancel()
+            readerJob = null
+            initJob?.cancel()
+            initJob = null
+            val current = socket
+            socket = null
+            heartRateSession?.close()
+            heartRateSession = null
+            sensorFrames.reset()
+            current
+        }
         try {
-            socket?.close()
+            activeSocket?.close()
         } catch (e: Exception) {
             Log.e(TAG, "Error closing socket", e)
         }
         Log.i(TAG, "disconnected")
-        socket = null
-        heartRateSession?.close()
-        heartRateSession = null
-        sensorFrames.reset()
         device.updateState {
             it.copy(
                 battery = it.battery.map { battery ->

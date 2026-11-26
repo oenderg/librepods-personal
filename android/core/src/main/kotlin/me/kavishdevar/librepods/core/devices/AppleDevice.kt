@@ -9,6 +9,8 @@ import android.util.Log
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -16,6 +18,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import me.kavishdevar.librepods.core.bluetooth.MacAddress
 import me.kavishdevar.librepods.core.bluetooth.aacp.AACPManager
@@ -120,6 +123,35 @@ class AppleDevice(
     val aacp = AACPManager(this)
     val att = ATTManager(this)
 
+    private val scopeLock = Any()
+    private var connectionScope: CoroutineScope? = null
+
+    private fun resetConnectionScope(): CoroutineScope = synchronized(scopeLock) {
+        connectionScope?.cancel()
+        CoroutineScope(Dispatchers.IO + SupervisorJob()).also { connectionScope = it }
+    }
+
+    private fun cancelConnectionScope() {
+        synchronized(scopeLock) {
+            connectionScope?.cancel()
+            connectionScope = null
+        }
+    }
+
+    internal fun onAacpSocketClosed() {
+        cancelConnectionScope()
+        _connectionState.update { current ->
+            if (current == ConnectionState.CONNECTED) ConnectionState.DISCONNECTED else current
+        }
+    }
+
+    /** Closes only the AACP session without tearing down system A2DP/HFP audio. */
+    fun closeAacp() {
+        cancelConnectionScope()
+        aacp.disconnect()
+        _connectionState.update { ConnectionState.DISCONNECTED }
+    }
+
 
     // ik, probably wrong place. TODO
     private val gestureDetector by lazy {
@@ -156,29 +188,41 @@ class AppleDevice(
             connectAudio()
         }
 
+        cancelConnectionScope()
         val success = aacp.connect() // && att.connect()
+        val connected = success && aacp.isConnected()
 
-        CoroutineScope(Dispatchers.IO).launch {
-            _state.update {
-                it.copy(
-                    loudSoundReductionEnabled = readATTCharacteristic(ATTHandle.LOUD_SOUND_REDUCTION)?.getOrNull(0)?.toInt() == 1,
-                    transparencyData = readATTCharacteristic(ATTHandle.TRANSPARENCY)?: byteArrayOf(),
-                    hearingAidData = readATTCharacteristic(ATTHandle.HEARING_AID)?: byteArrayOf()
-                )
+        if (connected) {
+            val scope = resetConnectionScope()
+            scope.launch {
+                val loudSoundReduction = readATTCharacteristic(ATTHandle.LOUD_SOUND_REDUCTION)?.getOrNull(0)?.toInt() == 1
+                val transparency = readATTCharacteristic(ATTHandle.TRANSPARENCY) ?: byteArrayOf()
+                val hearingAid = readATTCharacteristic(ATTHandle.HEARING_AID) ?: byteArrayOf()
+                if (!isActive || !aacp.isConnected()) return@launch
+                _state.update {
+                    it.copy(
+                        loudSoundReductionEnabled = loudSoundReduction,
+                        transparencyData = transparency,
+                        hearingAidData = hearingAid
+                    )
+                }
             }
         }
 
         _connectionState.update {
-            if (success) ConnectionState.CONNECTED else ConnectionState.DISCONNECTED
+            if (connected) ConnectionState.CONNECTED else ConnectionState.DISCONNECTED
         }
-        _connectionNumber.update {
-            it + 1
+        if (connected) {
+            _connectionNumber.update {
+                it + 1
+            }
         }
 
-        return success
+        return connected
     }
 
     override fun disconnect() {
+        cancelConnectionScope()
         _state.update {
             it.copy(
                 lastDisconnected = System.currentTimeMillis()
@@ -223,17 +267,21 @@ class AppleDevice(
 
     // can't use att notifications; keeping ATT connected causes airpods to disconnect every few seconds for some reason
     // we will poll the characteristic every 1 seconds instead.
-    fun observeATTCharacteristic(handle: ATTHandle): Job = CoroutineScope(Dispatchers.IO).launch {
-        while (true) {
-            val value = readATTCharacteristic(handle)
-            if (value != null) {
-                when (handle) {
-                    ATTHandle.LOUD_SOUND_REDUCTION -> _state.update { it.copy(loudSoundReductionEnabled = value.getOrNull(0)?.toInt() == 1) }
-                    ATTHandle.TRANSPARENCY -> _state.update { it.copy(transparencyData = value) }
-                    ATTHandle.HEARING_AID -> _state.update { it.copy(hearingAidData = value) }
+    fun observeATTCharacteristic(handle: ATTHandle): Job {
+        val scope = synchronized(scopeLock) { connectionScope } ?: CoroutineScope(Dispatchers.IO)
+        return scope.launch {
+            while (isActive && _connectionState.value == ConnectionState.CONNECTED) {
+                val value = readATTCharacteristic(handle)
+                if (!isActive || _connectionState.value != ConnectionState.CONNECTED) break
+                if (value != null) {
+                    when (handle) {
+                        ATTHandle.LOUD_SOUND_REDUCTION -> _state.update { it.copy(loudSoundReductionEnabled = value.getOrNull(0)?.toInt() == 1) }
+                        ATTHandle.TRANSPARENCY -> _state.update { it.copy(transparencyData = value) }
+                        ATTHandle.HEARING_AID -> _state.update { it.copy(hearingAidData = value) }
+                    }
                 }
+                delay(1000.milliseconds)
             }
-            delay(1000.milliseconds)
         }
     }
 
