@@ -9,6 +9,7 @@ import android.app.PendingIntent
 import android.app.Service
 import android.appwidget.AppWidgetManager
 import android.bluetooth.BluetoothA2dp
+import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothDevice
 import android.bluetooth.BluetoothHeadset
 import android.bluetooth.BluetoothManager
@@ -84,7 +85,10 @@ import me.kavishdevar.librepods.presentation.overlays.IslandWindow
 import me.kavishdevar.librepods.presentation.overlays.ProximityCardWindow
 import me.kavishdevar.librepods.presentation.widgets.BatteryWidget
 import me.kavishdevar.librepods.presentation.widgets.NoiseControlWidget
+import me.kavishdevar.librepods.utils.ACTION_INJECT_COLOROS_BATTERY
 import me.kavishdevar.librepods.utils.AppShortcutsManager
+import me.kavishdevar.librepods.utils.EXTRA_COLOROS_BATTERY_ARRAY
+import me.kavishdevar.librepods.utils.EXTRA_COLOROS_BATTERY_MAC
 import me.kavishdevar.librepods.utils.MediaController
 import me.kavishdevar.librepods.utils.calculateLevel
 import java.time.ZoneOffset
@@ -691,6 +695,9 @@ class LibrePodsService: Service() {
         Log.i(TAG, "Device disconnected: $mac")
         val device = devices.value[mac]?: return
         device.disconnect()
+        if (device is AppleDevice) {
+            broadcastColorOsBattery(device, disconnected = true)
+        }
         updateDeviceNotification(device = device)
     }
 
@@ -717,11 +724,25 @@ class LibrePodsService: Service() {
     private val bluetoothReceiver = object : BroadcastReceiver() {
         @SuppressLint("MissingPermission")
         override fun onReceive(context: Context?, intent: Intent) {
+            val action = intent.action
+            if (action == BluetoothAdapter.ACTION_STATE_CHANGED) {
+                when (intent.getIntExtra(BluetoothAdapter.EXTRA_STATE, BluetoothAdapter.ERROR)) {
+                    BluetoothAdapter.STATE_ON -> {
+                        Log.i(TAG, "Bluetooth turned ON; re-registering audio proxies and restarting BLE scan")
+                        registerAudioProfileProxies()
+                        bleManager.start()
+                    }
+                    BluetoothAdapter.STATE_TURNING_OFF, BluetoothAdapter.STATE_OFF -> {
+                        bleManager.stop()
+                    }
+                }
+                return
+            }
+
             val bluetoothDevice = intent.getParcelableExtra(
                 "android.bluetooth.device.extra.DEVICE",
                 BluetoothDevice::class.java
             )
-            val action = intent.action
 
             if (bluetoothDevice != null) {
                 when (action) {
@@ -875,6 +896,7 @@ class LibrePodsService: Service() {
 
     fun registerBluetoothReceivers() {
         val intentFilter = IntentFilter().apply {
+            addAction(BluetoothAdapter.ACTION_STATE_CHANGED)
             addAction("android.bluetooth.device.action.ACL_CONNECTED")
             addAction("android.bluetooth.device.action.ACL_DISCONNECTED")
             addAction("android.bluetooth.device.action.UUID")
@@ -1009,6 +1031,9 @@ class LibrePodsService: Service() {
 
                 if (previousConnectionState != state) {
                     updateWidgets()
+                    if (state == ConnectionState.CONNECTED && device is AppleDevice) {
+                        broadcastColorOsBattery(device)
+                    }
                 }
                 previousConnectionState = state
             }
@@ -1100,6 +1125,10 @@ class LibrePodsService: Service() {
                     ) {
                         audioYieldedToOtherDevice.remove(device.macAddress)
                     }
+                }
+
+                if (!state.battery.hasSameState(previousState.battery)) {
+                    broadcastColorOsBattery(device)
                 }
 
                 when {
@@ -1943,6 +1972,51 @@ class LibrePodsService: Service() {
             } else {
                 Log.d(TAG, "U SDK Extension <7")
             }
+        }
+    }
+
+    private fun broadcastColorOsBattery(device: AppleDevice, disconnected: Boolean = false) {
+        if (checkSelfPermission("android.permission.BLUETOOTH_PRIVILEGED") != PackageManager.PERMISSION_GRANTED) {
+            return
+        }
+        val payload = if (disconnected) {
+            intArrayOf(-1, -1, -1, 4, 4, 4)
+        } else {
+            val batteries = device.state.value.battery
+            if (batteries.isEmpty()) return
+            val left = batteries.find { it.component == BatteryComponent.LEFT }
+            val right = batteries.find { it.component == BatteryComponent.RIGHT }
+            val caseBat = batteries.find { it.component == BatteryComponent.CASE }
+
+            fun level(b: me.kavishdevar.librepods.core.devices.Battery?): Int =
+                if (b != null && b.status != BatteryStatus.DISCONNECTED && b.level in 0..100) b.level else -1
+
+            fun status(b: me.kavishdevar.librepods.core.devices.Battery?): Int = when (b?.status) {
+                BatteryStatus.CHARGING, BatteryStatus.OPTIMIZED_CHARGING -> 1
+                BatteryStatus.NOT_CHARGING -> 2
+                else -> 4
+            }
+
+            intArrayOf(
+                level(left),
+                level(right),
+                level(caseBat),
+                status(left),
+                status(right),
+                status(caseBat)
+            )
+        }
+
+        try {
+            sendBroadcast(
+                Intent(ACTION_INJECT_COLOROS_BATTERY).apply {
+                    setPackage("com.android.bluetooth")
+                    putExtra(EXTRA_COLOROS_BATTERY_MAC, device.macAddress.value)
+                    putExtra(EXTRA_COLOROS_BATTERY_ARRAY, payload)
+                }
+            )
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to broadcast ColorOS battery update", e)
         }
     }
 
