@@ -88,6 +88,19 @@
                 android:resource="@xml/battery_widget_info" />
         </receiver>
 
+        <receiver
+            android:name=".presentation.widgets.QuickControlWidget"
+            android:exported="false"
+            android:label="@string/quick_control_widget_label">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+            </intent-filter>
+
+            <meta-data
+                android:name="android.appwidget.provider"
+                android:resource="@xml/quick_control_widget_info" />
+        </receiver>
+
         <activity
             android:name=".presentation.activities.MainActivity"
             android:exported="true"
@@ -132,6 +145,15 @@
 
         <activity
             android:name=".presentation.activities.ShortcutActionActivity"
+            android:exported="true"
+            android:icon="@drawable/ic_airpods"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar"
+            android:excludeFromRecents="true"
+            android:noHistory="true"
+            android:taskAffinity="" />
+
+        <activity
+            android:name=".presentation.activities.ListeningModeDialogActivity"
             android:exported="true"
             android:icon="@drawable/ic_airpods"
             android:theme="@android:style/Theme.Translucent.NoTitleBar"

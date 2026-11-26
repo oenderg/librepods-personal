@@ -476,4 +476,6 @@
     <string name="qs_tile_cycle_modes_title">Modes to cycle</string>
     <string name="notification_mode_buttons">Notification mode buttons</string>
     <string name="notification_mode_buttons_description">Show listening mode action buttons in the persistent device notification.</string>
+    <string name="quick_control_widget_label">Quick Control (1×1)</string>
+    <string name="quick_control_widget_description">Open the listening mode and Conversation Awareness dialog from your home screen.</string>
 </resources>
