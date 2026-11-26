@@ -82,30 +82,29 @@ class ProximityCardWindow(
             return
         }
 
+        val wasVisible = cardState == ProximityCardState.VISIBLE
+
+        // Remove and tear down any existing overlay using the old WindowManager before switching.
+        cleanupAndRemoveView(preserveState = wasVisible)
+
         this.context = context
         this.usingAccessibilityService = context is LibrePodsAccessibilityService
         this.windowManager = context.getSystemService(WindowManager::class.java)
 
-        updateWindowParams()
-
-        composeView?.let { view ->
-            if (view.parent != null) {
-                windowManager.removeView(view)
-            }
-        }
+        if (!wasVisible) return
 
         setupComposeView()
 
-        if (cardState == ProximityCardState.VISIBLE) {
-            if (composeView?.parent == null) {
-                val params = createLayoutParams()
-                try {
-                    lifecycleOwner?.start()
-                    windowManager.addView(composeView, params)
-                    composeView?.visibility = View.VISIBLE
-                } catch (e: Exception) {
-                    Log.e("ProximityCardWindow", "Error adding overlay view: $e")
-                }
+        val view = composeView ?: return
+        if (view.parent == null) {
+            val params = createLayoutParams()
+            try {
+                lifecycleOwner?.start()
+                windowManager.addView(view, params)
+                view.visibility = View.VISIBLE
+            } catch (e: Exception) {
+                Log.e("ProximityCardWindow", "Error adding overlay view: $e")
+                cleanupAndRemoveView()
             }
         }
     }
@@ -151,18 +150,20 @@ class ProximityCardWindow(
         this.cardState = ProximityCardState.VISIBLE
         this.airPodsConnected = airPodsConnected
 
-        if (composeView == null) {
+        if (composeView == null || lifecycleOwner?.isDestroyed != false) {
             setupComposeView()
         }
 
-        if (composeView?.parent == null) {
+        val view = composeView
+        if (view != null && view.parent == null) {
             val params = createLayoutParams()
             try {
                 lifecycleOwner?.start()
-                windowManager.addView(composeView, params)
-                composeView?.visibility = View.VISIBLE
+                windowManager.addView(view, params)
+                view.visibility = View.VISIBLE
             } catch (e: Exception) {
                 Log.e("ProximityCardWindow", "Error adding overlay view: $e")
+                cleanupAndRemoveView()
             }
         } else {
             updateWindowParams()
@@ -276,11 +277,15 @@ class ProximityCardWindow(
 
     }
 
-    private fun cleanupAndRemoveView() {
+    private fun cleanupAndRemoveView(preserveState: Boolean = false) {
         try {
             composeView?.let { view ->
                 if (view.parent != null) {
-                    windowManager.removeView(view)
+                    try {
+                        windowManager.removeViewImmediate(view)
+                    } catch (e: Exception) {
+                        windowManager.removeView(view)
+                    }
                 }
             }
             lifecycleOwner?.stop()
@@ -289,7 +294,9 @@ class ProximityCardWindow(
         } finally {
             composeView = null
             lifecycleOwner = null
-            cardState = ProximityCardState.CLOSED
+            if (!preserveState) {
+                cardState = ProximityCardState.CLOSED
+            }
         }
     }
 }
@@ -307,7 +314,11 @@ private class ProxCardLifecycleOwner: LifecycleOwner, ViewModelStoreOwner, Saved
     override val viewModelStore: ViewModelStore
         get() = store
 
+    val isDestroyed: Boolean
+        get() = lifecycle.currentState == Lifecycle.State.DESTROYED
+
     fun start() {
+        if (lifecycle.currentState != Lifecycle.State.INITIALIZED) return
         savedStateRegistryController.performRestore(null)
         lifecycle.handleLifecycleEvent(Lifecycle.Event.ON_CREATE)
         lifecycle.handleLifecycleEvent(Lifecycle.Event.ON_START)
@@ -315,9 +326,20 @@ private class ProxCardLifecycleOwner: LifecycleOwner, ViewModelStoreOwner, Saved
     }
 
     fun stop() {
-        lifecycle.handleLifecycleEvent(Lifecycle.Event.ON_PAUSE)
-        lifecycle.handleLifecycleEvent(Lifecycle.Event.ON_STOP)
-        lifecycle.handleLifecycleEvent(Lifecycle.Event.ON_DESTROY)
+        val state = lifecycle.currentState
+        if (state == Lifecycle.State.INITIALIZED || state == Lifecycle.State.DESTROYED) {
+            store.clear()
+            return
+        }
+        if (state.isAtLeast(Lifecycle.State.RESUMED)) {
+            lifecycle.handleLifecycleEvent(Lifecycle.Event.ON_PAUSE)
+        }
+        if (lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)) {
+            lifecycle.handleLifecycleEvent(Lifecycle.Event.ON_STOP)
+        }
+        if (lifecycle.currentState.isAtLeast(Lifecycle.State.CREATED)) {
+            lifecycle.handleLifecycleEvent(Lifecycle.Event.ON_DESTROY)
+        }
         store.clear()
     }
 }

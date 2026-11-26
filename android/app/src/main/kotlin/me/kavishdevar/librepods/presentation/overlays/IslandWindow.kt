@@ -114,28 +114,31 @@ class IslandWindow(
             return
         }
 
+        val wasVisible = islandState != IslandState.CLOSE
+        val previousState = islandState
+
+        // Remove and tear down any existing overlay using the old WindowManager before switching.
+        cleanupAndRemoveView(preserveState = wasVisible)
+
         this.context = context
         this.usingAccessibilityService = context is LibrePodsAccessibilityService
         this.windowManager = context.getSystemService(WindowManager::class.java)
 
-        updateWindowParams(islandState)
+        if (!wasVisible) return
 
-        composeView?.let { view ->
-            if (view.parent != null) {
-                windowManager.removeView(view)
-            }
-        }
-
+        islandState = previousState
         setupComposeView()
 
-        if (composeView?.parent == null) {
+        val view = composeView ?: return
+        if (view.parent == null) {
             val params = createLayoutParams(islandState)
             try {
                 lifecycleOwner?.start()
-                windowManager.addView(composeView, params)
-                composeView?.visibility = View.VISIBLE
+                windowManager.addView(view, params)
+                view.visibility = View.VISIBLE
             } catch (e: Exception) {
                 Log.e("IslandWindow", "Error adding overlay view: $e")
+                cleanupAndRemoveView()
             }
         }
     }
@@ -226,7 +229,7 @@ class IslandWindow(
             onAdaptiveStrengthChanged(it)
         }
 
-        if (composeView == null) {
+        if (composeView == null || lifecycleOwner?.isDestroyed != false) {
             setupComposeView()
         }
 
@@ -234,14 +237,16 @@ class IslandWindow(
         // window is first measured at the platform's preferred dialog width and would clip the island.
         islandState = forcedState?: if (appSettings.islandSettings.enableExpanded) IslandState.EXPANDED else IslandState.COMPACT
 
-        if (composeView?.parent == null) {
+        val view = composeView
+        if (view != null && view.parent == null) {
             val params = createLayoutParams(islandState)
             try {
                 lifecycleOwner?.start()
-                windowManager.addView(composeView, params)
-                composeView?.visibility = View.VISIBLE
+                windowManager.addView(view, params)
+                view.visibility = View.VISIBLE
             } catch (e: Exception) {
                 Log.e("IslandWindow", "Error adding overlay view: $e")
+                cleanupAndRemoveView()
             }
         } else {
             updateWindowParams(islandState)
@@ -375,11 +380,15 @@ class IslandWindow(
         updateWindowParams(islandState)
     }
 
-    private fun cleanupAndRemoveView() {
+    private fun cleanupAndRemoveView(preserveState: Boolean = false) {
         try {
             composeView?.let { view ->
                 if (view.parent != null) {
-                    windowManager.removeView(view)
+                    try {
+                        windowManager.removeViewImmediate(view)
+                    } catch (e: Exception) {
+                        windowManager.removeView(view)
+                    }
                 }
             }
             lifecycleOwner?.stop()
@@ -388,7 +397,9 @@ class IslandWindow(
         } finally {
             composeView = null
             lifecycleOwner = null
-            islandState = IslandState.CLOSE
+            if (!preserveState) {
+                islandState = IslandState.CLOSE
+            }
         }
     }
 }
@@ -402,7 +413,11 @@ private class IslandLifecycleOwner: LifecycleOwner, ViewModelStoreOwner, SavedSt
     override val savedStateRegistry: SavedStateRegistry get() = savedStateRegistryController.savedStateRegistry
     override val viewModelStore: ViewModelStore get() = store
 
+    val isDestroyed: Boolean
+        get() = lifecycle.currentState == Lifecycle.State.DESTROYED
+
     fun start() {
+        if (lifecycle.currentState != Lifecycle.State.INITIALIZED) return
         savedStateRegistryController.performRestore(null)
         lifecycle.handleLifecycleEvent(Lifecycle.Event.ON_CREATE)
         lifecycle.handleLifecycleEvent(Lifecycle.Event.ON_START)
@@ -410,9 +425,20 @@ private class IslandLifecycleOwner: LifecycleOwner, ViewModelStoreOwner, SavedSt
     }
 
     fun stop() {
-        lifecycle.handleLifecycleEvent(Lifecycle.Event.ON_PAUSE)
-        lifecycle.handleLifecycleEvent(Lifecycle.Event.ON_STOP)
-        lifecycle.handleLifecycleEvent(Lifecycle.Event.ON_DESTROY)
+        val state = lifecycle.currentState
+        if (state == Lifecycle.State.INITIALIZED || state == Lifecycle.State.DESTROYED) {
+            store.clear()
+            return
+        }
+        if (state.isAtLeast(Lifecycle.State.RESUMED)) {
+            lifecycle.handleLifecycleEvent(Lifecycle.Event.ON_PAUSE)
+        }
+        if (lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)) {
+            lifecycle.handleLifecycleEvent(Lifecycle.Event.ON_STOP)
+        }
+        if (lifecycle.currentState.isAtLeast(Lifecycle.State.CREATED)) {
+            lifecycle.handleLifecycleEvent(Lifecycle.Event.ON_DESTROY)
+        }
         store.clear()
     }
 }

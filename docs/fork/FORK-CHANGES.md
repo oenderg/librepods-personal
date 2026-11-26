@@ -49,9 +49,10 @@ This document summarizes the fixes and features carried on `oenderg/librepods-pe
 - **Notification & Widget improvements (`ef5c55d`):**
   - Added *Settings → Interaction → Notification mode buttons* toggle.
   - Fixed `NoiseControlWidget` (`LibrePodsIntents` action/extra, active-mode highlight, `ALLOW_OFF_OPTION` visibility, live updates) and `BatteryWidget.onUpdate()`.
-- **Dynamic Island polish (`bebd347`, `ba7115b`):**
+- **Dynamic Island & overlay lifecycle polish (`bebd347`, `ba7115b`, overlay lifecycle fix):**
   - Preserves BLE-advertised battery across `loadInitialState()`, fixes single-bud `0%` flash via `computeDisplayBatteryLevel()`, and hides battery ring/text until a `> 0` level is known.
   - Wires `IslandType.MOVED_TO_OTHER_DEVICE` (with circular iOS-blue undo button calling `sendHijackReversed` to reclaim audio) and `IslandType.TAKING_OVER`.
+  - Fixes `ComposeView` / `LifecycleRegistry` crash in `IslandWindow` and `ProximityCardWindow` (`updateContext()` no longer adds a closed island overlay, tears down with the old `WindowManager` via `removeViewImmediate()`, and guards `start()`/`stop()`).
 
 ## Upstream PRs Integrated
 - `#850` (`30ff029`) — Toggle listening mode app shortcut
