@@ -341,6 +341,7 @@ class LibrePodsService: Service() {
 
         loadDevices()
 
+        clearYieldedAudioStrategies()
         restoreSavedSpeakerVolumeIfOnSpeaker()
 
         observeDynamicShortcuts()
@@ -451,6 +452,7 @@ class LibrePodsService: Service() {
         pendingA2dpReceivers.keys.toList().forEach { cancelPendingA2dpReceiver(it) }
         audioDisconnectingDevices.clear()
         audioYieldedToOtherDevice.clear()
+        clearYieldedAudioStrategies()
         restoreSavedSpeakerVolumeIfOnSpeaker()
         runCatching { unregisterBluetoothReceivers() }
         closeAudioProfileProxies()
@@ -567,7 +569,6 @@ class LibrePodsService: Service() {
     }
 
     private fun isMediaRoutedToSpeaker(): Boolean {
-        if (hasActiveA2dpDevice()) return false
         val audioManager = getSystemService(AudioManager::class.java) ?: return false
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             return try {
@@ -578,11 +579,103 @@ class LibrePodsService: Service() {
                 val devices = audioManager.getAudioDevicesForAttributes(attrs)
                 devices.isNotEmpty() && devices.all { it.type == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER }
             } catch (e: Exception) {
-                Log.w(TAG, "getDevicesForAttributes failed", e)
+                Log.w(TAG, "getAudioDevicesForAttributes failed", e)
                 false
             }
         }
-        return true
+        return !hasActiveA2dpDevice()
+    }
+
+    private fun hasModifyAudioRoutingPermission(): Boolean =
+        checkSelfPermission("android.permission.MODIFY_AUDIO_ROUTING") == PackageManager.PERMISSION_GRANTED
+
+    private fun getYieldAudioProductStrategies(): List<Any> {
+        return try {
+            val strategyClass = Class.forName("android.media.audiopolicy.AudioProductStrategy")
+            val getAll = AudioManager::class.java.getMethod("getAudioProductStrategies")
+            val getName = strategyClass.getMethod("getName")
+            val getId = strategyClass.getMethod("getId")
+            val targetNames = setOf(
+                "STRATEGY_MEDIA",
+                "STRATEGY_SONIFICATION",
+                "STRATEGY_SONIFICATION_RESPECTFUL",
+                "STRATEGY_DTMF",
+                "STRATEGY_ACCESSIBILITY",
+                "STRATEGY_ASSISTANT"
+            )
+            val targetIds = setOf(0, 2, 3, 4, 7, 11)
+            @Suppress("UNCHECKED_CAST")
+            val all = getAll.invoke(null) as? List<Any> ?: return emptyList()
+            all.filter { strategy ->
+                val name = runCatching { getName.invoke(strategy) as? String }.getOrNull()
+                val id = runCatching { getId.invoke(strategy) as? Int }.getOrNull()
+                (name != null && name in targetNames) || (id != null && id in targetIds)
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to query AudioProductStrategies", e)
+            emptyList()
+        }
+    }
+
+    /**
+     * Routes media/notification strategies to TYPE_BUILTIN_SPEAKER while keeping
+     * A2DP attached and open in AudioPolicyManager. Avoids the ~450 ms teardown
+     * and re-open overhead of BluetoothAdapter.removeActiveDevice() / setActiveDevice().
+     */
+    private fun yieldStrategiesToSpeaker(): Boolean {
+        if (!hasModifyAudioRoutingPermission()) return false
+        val audioManager = getSystemService(AudioManager::class.java) ?: return false
+        val strategies = getYieldAudioProductStrategies()
+        if (strategies.isEmpty()) return false
+        return try {
+            val strategyClass = Class.forName("android.media.audiopolicy.AudioProductStrategy")
+            val attrClass = Class.forName("android.media.AudioDeviceAttributes")
+            val roleOutput = attrClass.getField("ROLE_OUTPUT").getInt(null)
+            val speakerAttr = attrClass.getConstructor(
+                Int::class.javaPrimitiveType,
+                Int::class.javaPrimitiveType,
+                String::class.java
+            ).newInstance(roleOutput, AudioDeviceInfo.TYPE_BUILTIN_SPEAKER, "")
+            val setPreferred = audioManager.javaClass.getMethod(
+                "setPreferredDeviceForStrategy",
+                strategyClass,
+                attrClass
+            )
+            var setCount = 0
+            for (strategy in strategies) {
+                val ok = setPreferred.invoke(audioManager, strategy, speakerAttr) as? Boolean ?: false
+                if (ok) setCount++
+            }
+            Log.i(TAG, "Smart Routing: setPreferredDeviceForStrategy(SPEAKER) applied to $setCount/${strategies.size} strategies")
+            setCount > 0
+        } catch (e: Exception) {
+            Log.w(TAG, "setPreferredDeviceForStrategy(SPEAKER) failed; falling back to removeActiveDevice", e)
+            false
+        }
+    }
+
+    private fun clearYieldedAudioStrategies() {
+        if (!hasModifyAudioRoutingPermission()) return
+        val audioManager = getSystemService(AudioManager::class.java) ?: return
+        val strategies = getYieldAudioProductStrategies()
+        if (strategies.isEmpty()) return
+        try {
+            val strategyClass = Class.forName("android.media.audiopolicy.AudioProductStrategy")
+            val removePreferred = audioManager.javaClass.getMethod(
+                "removePreferredDeviceForStrategy",
+                strategyClass
+            )
+            var cleared = 0
+            for (strategy in strategies) {
+                val ok = removePreferred.invoke(audioManager, strategy) as? Boolean ?: false
+                if (ok) cleared++
+            }
+            if (cleared > 0) {
+                Log.i(TAG, "Smart Routing: removePreferredDeviceForStrategy cleared $cleared/${strategies.size} strategies")
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "removePreferredDeviceForStrategy failed", e)
+        }
     }
 
     private fun getSavedSpeakerVolume(): Int =
@@ -697,9 +790,33 @@ class LibrePodsService: Service() {
             .firstOrNull { it.connectionState.value == ConnectionState.CONNECTED } ?: return
 
         val wasYielded = audioYieldedToOtherDevice.remove(connectedApple.macAddress)
-        if (wasYielded) speakerVolumeJob?.cancel()
+        if (wasYielded) {
+            speakerVolumeJob?.cancel()
+        }
         val hasOtherPeer = localMac != null &&
             connectedApple.state.value.connectedDevices.any { !it.macAddress.value.equals(localMac, ignoreCase = true) }
+
+        // Claim ownership & send hijack BEFORE clearing preferred strategies:
+        // removePreferredDeviceForStrategy() blocks on AudioFlinger's A2DP start
+        // handshake, so sending AACP ownership first lets the AirPods begin
+        // tearing down the Mac stream in parallel with Android's PAL route switch.
+        if (localMac != null && hasOtherPeer) {
+            Log.i(TAG, "Smart Routing: claiming ownership & sending hijack request for ${connectedApple.macAddress.toRedactedString()}")
+            serviceCoroutineScope.launch {
+                connectedApple.aacp.sendControlCommand(ControlCommandIdentifier.OWNS_CONNECTION.value, 1)
+                connectedApple.aacp.sendMediaInformataion(localMac, streamingState = false)
+                if (wasYielded || !connectedApple.state.value.owns) {
+                    connectedApple.aacp.sendSmartRoutingShowUI(localMac)
+                    connectedApple.aacp.sendHijackRequest(localMac)
+                }
+            }
+        }
+
+        if (wasYielded) {
+            serviceCoroutineScope.launch {
+                clearYieldedAudioStrategies()
+            }
+        }
 
         // Always ensure the AirPods are active A2DP when intentional media starts
         // on this phone (prevents getting stuck on speaker if state ever desyncs).
@@ -711,8 +828,12 @@ class LibrePodsService: Service() {
             connectedApple.connectA2dp()
             setActiveAudioDevice(connectedApple.bluetoothDevice)
         } else if (wasYielded || audioConnected == true) {
-            Log.i(TAG, "Phone started media playback; ensuring ${connectedApple.macAddress.toRedactedString()} is active A2DP device (wasYielded=$wasYielded)")
-            setActiveAudioDevice(connectedApple.bluetoothDevice)
+            if (!hasActiveA2dpDevice()) {
+                Log.i(TAG, "Phone started media playback; ensuring ${connectedApple.macAddress.toRedactedString()} is active A2DP device (wasYielded=$wasYielded)")
+                setActiveAudioDevice(connectedApple.bluetoothDevice)
+            } else {
+                Log.i(TAG, "Phone started media playback; A2DP already active for ${connectedApple.macAddress.toRedactedString()} (fast strategy resume, wasYielded=$wasYielded)")
+            }
         }
 
         if (wasYielded) {
@@ -720,18 +841,6 @@ class LibrePodsService: Service() {
                 device = connectedApple,
                 type = IslandType.TAKING_OVER
             )
-        }
-
-        if (localMac != null && hasOtherPeer) {
-            Log.i(TAG, "Smart Routing: claiming ownership & sending hijack request for ${connectedApple.macAddress.toRedactedString()}")
-            serviceCoroutineScope.launch {
-                connectedApple.aacp.sendControlCommand(ControlCommandIdentifier.OWNS_CONNECTION.value, 1)
-                connectedApple.aacp.sendMediaInformataion(localMac, streamingState = false)
-                if (wasYielded || !connectedApple.state.value.owns) {
-                    connectedApple.aacp.sendSmartRoutingShowUI(localMac)
-                    connectedApple.aacp.sendHijackRequest(localMac)
-                }
-            }
         }
     }
 
@@ -767,8 +876,12 @@ class LibrePodsService: Service() {
     private fun reverseHandoff(device: AppleDevice) {
         val localMac = getLocalBluetoothMac()
         audioYieldedToOtherDevice.remove(device.macAddress)
+        speakerVolumeJob?.cancel()
+        clearYieldedAudioStrategies()
         Log.i(TAG, "Smart Routing: user tapped reverse banner; reclaiming ${device.macAddress.toRedactedString()}")
-        setActiveAudioDevice(device.bluetoothDevice)
+        if (!hasActiveA2dpDevice()) {
+            setActiveAudioDevice(device.bluetoothDevice)
+        }
         if (localMac != null) {
             serviceCoroutineScope.launch {
                 device.aacp.sendControlCommand(ControlCommandIdentifier.OWNS_CONNECTION.value, 1)
@@ -792,7 +905,9 @@ class LibrePodsService: Service() {
         Log.i(TAG, "Smart Routing: yielding ${device.macAddress.toRedactedString()} ($reason)")
         device.aacp.sendControlCommand(ControlCommandIdentifier.OWNS_CONNECTION.value, byteArrayOf(0x00))
         MediaController.onOwnershipLost()
-        removeActiveAudioDevice()
+        if (!yieldStrategiesToSpeaker()) {
+            removeActiveAudioDevice()
+        }
         scheduleMuteSpeakerWhileYielded()
         showIsland(
             device = device,
@@ -827,6 +942,7 @@ class LibrePodsService: Service() {
         audioReleasedByLibrePods.remove(mac)
         pendingAudioReleaseChecks.remove(mac)?.cancel()
         cancelPendingA2dpReceiver(mac)
+        clearYieldedAudioStrategies()
         scheduleRestoreSpeakerVolume()
         Log.i(TAG, "Device disconnected: $mac")
         val device = devices.value[mac]?: return
@@ -2036,6 +2152,7 @@ class LibrePodsService: Service() {
                     )
                     audioYieldedToOtherDevice.remove(device.macAddress)
                     audioReleasedByLibrePods.add(device.macAddress)
+                    clearYieldedAudioStrategies()
                     device.disableAudio()
                     device.disconnectAudio()
                     scheduleRestoreSpeakerVolume()
