@@ -8,7 +8,7 @@ This document summarizes the fixes and features carried on `oenderg/librepods-pe
   - Reverses little-endian MAC bytes in `AudioSourcePacket` and fixes the OPACK length byte for `"YES"` in `AACPManager.sendMediaInformataion()` (upstream `#943`).
   - Releases the ACL/AACP link on Android Bluetooth Settings → Disconnect after a 3 s grace window (only when LibrePods didn't release audio itself), and only attaches AACP in the background when A2DP/HFP is connected or connecting (upstream `#921`).
   - Guards `alwaysConnectWhenAccessoryDisconnected` to require `AccessoryState.Disconnected` (upstream `#942`).
-  - Yields active A2DP (`removeActiveDevice(0)`) when another Apple host takes audio, and restores (`setActiveDevice(dev, 0)`) on phone playback.
+  - Yields active A2DP (`removeActiveDevice(0)`) when another Apple host takes audio, silently mutes phone speaker `STREAM_MUSIC` once `AudioPolicyManager` routes to `TYPE_BUILTIN_SPEAKER` (preventing ~45 ms speaker bleed on takeover; restored safely on disconnect/stop/unwear), and restores (`setActiveDevice(dev, 0)`) on phone playback.
   - Implements the Smart Routing handshake (TiPi/MediaInfo registration, `OWNS_CONNECTION`, `sendSmartRoutingShowUI` for macOS *"Moved to iPhone"* banner, `sendHijackRequest`, and `OwnershipToFalseRequest` yield + pause).
   - Details in [`SMART-ROUTING.md`](SMART-ROUTING.md).
 - **Non-MediaSession audio takeover toggle (`56121a4`):**
@@ -25,6 +25,7 @@ This document summarizes the fixes and features carried on `oenderg/librepods-pe
   - Serialized `AACPManager` socket teardown and guarded immediate EOF vs. `CONNECTED`.
   - Scoped ATT reads/polling in `AppleDevice` to a per-connection `CoroutineScope`.
   - Added AACP-only teardown in `LibrePodsService.onDestroy()`, `STATE_DISCONNECTING` guard during external disconnects, and pending A2DP receiver cleanup.
+  - Fixed ear-detection / A2DP reconnect race when buds are re-inserted within 3 s of LibrePods releasing audio (`audioReleasedByLibrePods` no longer schedules `pendingAudioReleaseChecks`), plus a media-start A2DP recovery safety net in `restoreYieldedAudioDevice()`.
 - **`RenamePacket` & `RenameScreen` fix (`4ca583a`):**
   - Fixed 16-bit LE length and UTF-8 byte-length encoding in `RenamePacket` (prevented AirPods firmware crashes/reboots when opening the Rename screen).
   - Skipped sending on screen open/unchanged text and debounced typing by 400 ms.
@@ -36,6 +37,7 @@ This document summarizes the fixes and features carried on `oenderg/librepods-pe
 ## ColorOS 17 Native Battery Integration
 - **Native Status Bar & Bluetooth Settings battery injection (`96258bd`):**
   - Hooks `RemoteDevices` → `OplusRemoteDevicesExtImpl` inside `com.android.bluetooth` via LSPosed to feed live AirPods battery into ColorOS's native Status Bar Bluetooth battery bar and `In use. Battery: XX %` subtitle in Bluetooth Settings.
+  - Guards `broadcastColorOsBattery()` on `ConnectionState.CONNECTED` (and broadcasts disconnected on leaving `CONNECTED`) so BLE case adverts don't show a status bar battery icon while AirPods are in the case.
   - Safely no-ops on AOSP and non-ColorOS OEMs. Details in [`COLOROS-BATTERY.md`](COLOROS-BATTERY.md).
 
 ## Quick Settings, Shortcuts, Widgets & Dynamic Island

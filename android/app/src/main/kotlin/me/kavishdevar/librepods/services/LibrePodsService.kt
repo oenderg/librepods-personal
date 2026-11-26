@@ -21,6 +21,8 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.PackageManager
+import android.media.AudioAttributes
+import android.media.AudioDeviceInfo
 import android.media.AudioManager
 import android.os.BatteryManager
 import android.os.Binder
@@ -103,6 +105,7 @@ private const val TAG = "LibrePodsService"
 // A2DP and HFP disconnect within a few hundred ms of each other; wait this long
 // before deciding the user disconnected the device's audio.
 private const val AUDIO_RELEASE_GRACE_MS = 3_000L
+private const val PREF_SAVED_SPEAKER_VOLUME = "yielded_saved_speaker_volume"
 
 @SuppressLint("MissingPermission")
 class LibrePodsService: Service() {
@@ -200,6 +203,9 @@ class LibrePodsService: Service() {
         Collections.synchronizedSet(mutableSetOf())
 
     private val pendingAudioReleaseChecks = ConcurrentHashMap<MacAddress, Job>()
+
+    @Volatile
+    private var speakerVolumeJob: Job? = null
 
     // Devices whose A2DP/HFP profile is disconnecting externally (outside
     // LibrePods's "disconnect when not wearing"). Prevents ear-detection from
@@ -335,6 +341,8 @@ class LibrePodsService: Service() {
 
         loadDevices()
 
+        restoreSavedSpeakerVolumeIfOnSpeaker()
+
         observeDynamicShortcuts()
 
         bleManager.start()
@@ -442,6 +450,8 @@ class LibrePodsService: Service() {
         pendingAudioReleaseChecks.clear()
         pendingA2dpReceivers.keys.toList().forEach { cancelPendingA2dpReceiver(it) }
         audioDisconnectingDevices.clear()
+        audioYieldedToOtherDevice.clear()
+        restoreSavedSpeakerVolumeIfOnSpeaker()
         runCatching { unregisterBluetoothReceivers() }
         closeAudioProfileProxies()
         bleManager.stop()
@@ -536,6 +546,122 @@ class LibrePodsService: Service() {
         null
     }
 
+    private fun hasActiveA2dpDevice(): Boolean {
+        val adapter = getSystemService(BluetoothManager::class.java)?.adapter
+        if (adapter != null) {
+            try {
+                val method = adapter.javaClass.getMethod("getActiveDevices", Int::class.javaPrimitiveType)
+                @Suppress("UNCHECKED_CAST")
+                val active = method.invoke(adapter, BluetoothProfile.A2DP) as? List<BluetoothDevice?>
+                if (active != null) return active.any { it != null }
+            } catch (_: Exception) {
+            }
+        }
+        val proxy = a2dpProxy ?: return false
+        return try {
+            val method = proxy.javaClass.getMethod("getActiveDevice")
+            method.invoke(proxy) != null
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    private fun isMediaRoutedToSpeaker(): Boolean {
+        if (hasActiveA2dpDevice()) return false
+        val audioManager = getSystemService(AudioManager::class.java) ?: return false
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            return try {
+                val attrs = AudioAttributes.Builder()
+                    .setUsage(AudioAttributes.USAGE_MEDIA)
+                    .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+                    .build()
+                val devices = audioManager.getAudioDevicesForAttributes(attrs)
+                devices.isNotEmpty() && devices.all { it.type == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER }
+            } catch (e: Exception) {
+                Log.w(TAG, "getDevicesForAttributes failed", e)
+                false
+            }
+        }
+        return true
+    }
+
+    private fun getSavedSpeakerVolume(): Int =
+        getSharedPreferences("settings", MODE_PRIVATE).getInt(PREF_SAVED_SPEAKER_VOLUME, -1)
+
+    private fun setSavedSpeakerVolume(volume: Int) {
+        getSharedPreferences("settings", MODE_PRIVATE).edit().apply {
+            if (volume < 0) remove(PREF_SAVED_SPEAKER_VOLUME) else putInt(PREF_SAVED_SPEAKER_VOLUME, volume)
+            apply()
+        }
+    }
+
+    /**
+     * While AirPods are yielded to another host, Android routes STREAM_MUSIC to
+     * the phone speaker. Silently zeroing speaker volume prevents the brief
+     * (~40-50 ms) speaker bleed when media starts before A2DP finishes switching.
+     * Android tracks A2DP volume separately, so AirPods play at their own level.
+     *
+     * Must only run once AudioPolicyManager actually routes USAGE_MEDIA to
+     * TYPE_BUILTIN_SPEAKER (which lags ~500 ms behind removeActiveDevice()),
+     * otherwise setStreamVolume would mutate A2DP volume instead of speaker.
+     */
+    @Synchronized
+    private fun muteSpeakerWhileYielded(): Boolean {
+        if (audioYieldedToOtherDevice.isEmpty()) return false
+        if (!isMediaRoutedToSpeaker()) return false
+        val audioManager = getSystemService(AudioManager::class.java) ?: return false
+        val current = audioManager.getStreamVolume(AudioManager.STREAM_MUSIC)
+        if (current > 0) {
+            setSavedSpeakerVolume(current)
+            audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, 0, 0)
+            Log.i(TAG, "Smart Routing: muted phone speaker while yielded (saved volume=$current)")
+        }
+        return true
+    }
+
+    private fun scheduleMuteSpeakerWhileYielded() {
+        speakerVolumeJob?.cancel()
+        speakerVolumeJob = serviceCoroutineScope.launch {
+            repeat(15) {
+                if (audioYieldedToOtherDevice.isEmpty()) return@launch
+                if (muteSpeakerWhileYielded()) return@launch
+                delay(100L)
+            }
+        }
+    }
+
+    @Synchronized
+    private fun restoreSavedSpeakerVolumeIfOnSpeaker(): Boolean {
+        val saved = getSavedSpeakerVolume()
+        if (saved < 0) return true
+        if (audioYieldedToOtherDevice.isNotEmpty()) return false
+        if (!isMediaRoutedToSpeaker()) return false
+        val audioManager = getSystemService(AudioManager::class.java) ?: return false
+        setSavedSpeakerVolume(-1)
+        val current = audioManager.getStreamVolume(AudioManager.STREAM_MUSIC)
+        if (current == 0) {
+            val maxVol = audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
+            val target = saved.coerceIn(0, maxVol)
+            audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, target, 0)
+            Log.i(TAG, "Smart Routing: restored phone speaker volume to $target")
+        } else {
+            Log.d(TAG, "Smart Routing: speaker volume already changed by user ($current); not overwriting with $saved")
+        }
+        return true
+    }
+
+    private fun scheduleRestoreSpeakerVolume() {
+        if (getSavedSpeakerVolume() < 0) return
+        speakerVolumeJob?.cancel()
+        speakerVolumeJob = serviceCoroutineScope.launch {
+            repeat(15) {
+                if (audioYieldedToOtherDevice.isNotEmpty()) return@launch
+                if (restoreSavedSpeakerVolumeIfOnSpeaker()) return@launch
+                delay(100L)
+            }
+        }
+    }
+
     private fun removeActiveAudioDevice() {
         val adapter = getSystemService(BluetoothManager::class.java)?.adapter ?: return
         try {
@@ -571,12 +697,20 @@ class LibrePodsService: Service() {
             .firstOrNull { it.connectionState.value == ConnectionState.CONNECTED } ?: return
 
         val wasYielded = audioYieldedToOtherDevice.remove(connectedApple.macAddress)
+        if (wasYielded) speakerVolumeJob?.cancel()
         val hasOtherPeer = localMac != null &&
             connectedApple.state.value.connectedDevices.any { !it.macAddress.value.equals(localMac, ignoreCase = true) }
 
         // Always ensure the AirPods are active A2DP when intentional media starts
         // on this phone (prevents getting stuck on speaker if state ever desyncs).
-        if (wasYielded || isAudioConnected(connectedApple.bluetoothDevice) == true) {
+        val audioConnected = isAudioConnected(connectedApple.bluetoothDevice)
+        if (audioConnected == false && earPresenceOf(connectedApple.state.value.componentState) != EarPresence.NONE) {
+            Log.i(TAG, "Phone started media playback while wearing ${connectedApple.macAddress.toRedactedString()} but A2DP is disconnected; re-enabling audio")
+            audioReleasedByLibrePods.remove(connectedApple.macAddress)
+            connectedApple.enableAudio()
+            connectedApple.connectA2dp()
+            setActiveAudioDevice(connectedApple.bluetoothDevice)
+        } else if (wasYielded || audioConnected == true) {
             Log.i(TAG, "Phone started media playback; ensuring ${connectedApple.macAddress.toRedactedString()} is active A2DP device (wasYielded=$wasYielded)")
             setActiveAudioDevice(connectedApple.bluetoothDevice)
         }
@@ -659,6 +793,7 @@ class LibrePodsService: Service() {
         device.aacp.sendControlCommand(ControlCommandIdentifier.OWNS_CONNECTION.value, byteArrayOf(0x00))
         MediaController.onOwnershipLost()
         removeActiveAudioDevice()
+        scheduleMuteSpeakerWhileYielded()
         showIsland(
             device = device,
             type = IslandType.MOVED_TO_OTHER_DEVICE,
@@ -692,6 +827,7 @@ class LibrePodsService: Service() {
         audioReleasedByLibrePods.remove(mac)
         pendingAudioReleaseChecks.remove(mac)?.cancel()
         cancelPendingA2dpReceiver(mac)
+        scheduleRestoreSpeakerVolume()
         Log.i(TAG, "Device disconnected: $mac")
         val device = devices.value[mac]?: return
         device.disconnect()
@@ -744,6 +880,22 @@ class LibrePodsService: Service() {
                 BluetoothDevice::class.java
             )
 
+            if (action == "android.bluetooth.a2dp.profile.action.ACTIVE_DEVICE_CHANGED") {
+                if (bluetoothDevice != null) {
+                    // If the user manually selected the AirPods in Android's output switcher,
+                    // respect that and stop treating them as yielded.
+                    audioYieldedToOtherDevice.remove(MacAddress(bluetoothDevice.address))
+                    speakerVolumeJob?.cancel()
+                } else {
+                    if (audioYieldedToOtherDevice.isNotEmpty()) {
+                        scheduleMuteSpeakerWhileYielded()
+                    } else {
+                        scheduleRestoreSpeakerVolume()
+                    }
+                }
+                return
+            }
+
             if (bluetoothDevice != null) {
                 when (action) {
                     BluetoothDevice.ACTION_ACL_CONNECTED -> {
@@ -767,12 +919,6 @@ class LibrePodsService: Service() {
                         bluetoothDevice,
                         intent.getIntExtra(BluetoothProfile.EXTRA_STATE, -1)
                     )
-
-                    "android.bluetooth.a2dp.profile.action.ACTIVE_DEVICE_CHANGED" -> {
-                        // If the user manually selected the AirPods in Android's output switcher,
-                        // respect that and stop treating them as yielded.
-                        audioYieldedToOtherDevice.remove(MacAddress(bluetoothDevice.address))
-                    }
                 }
             }
         }
@@ -864,10 +1010,12 @@ class LibrePodsService: Service() {
 
             BluetoothProfile.STATE_DISCONNECTED -> {
                 val device = devices.value[mac] as? AppleDevice ?: return
-                if (mac !in audioReleasedByLibrePods) {
-                    audioDisconnectingDevices.add(mac)
-                    cancelPendingA2dpReceiver(mac)
+                if (mac in audioReleasedByLibrePods) {
+                    Log.d(TAG, "Audio for ${mac.toRedactedString()} was released by LibrePods; keeping AACP for ear detection")
+                    return
                 }
+                audioDisconnectingDevices.add(mac)
+                cancelPendingA2dpReceiver(mac)
                 pendingAudioReleaseChecks.remove(mac)?.cancel()
                 pendingAudioReleaseChecks[mac] = serviceCoroutineScope.launch {
                     try {
@@ -1031,8 +1179,12 @@ class LibrePodsService: Service() {
 
                 if (previousConnectionState != state) {
                     updateWidgets()
-                    if (state == ConnectionState.CONNECTED && device is AppleDevice) {
-                        broadcastColorOsBattery(device)
+                    if (device is AppleDevice) {
+                        if (state == ConnectionState.CONNECTED) {
+                            broadcastColorOsBattery(device)
+                        } else if (previousConnectionState == ConnectionState.CONNECTED) {
+                            broadcastColorOsBattery(device, disconnected = true)
+                        }
                     }
                 }
                 previousConnectionState = state
@@ -1127,7 +1279,9 @@ class LibrePodsService: Service() {
                     }
                 }
 
-                if (!state.battery.hasSameState(previousState.battery)) {
+                if (!state.battery.hasSameState(previousState.battery) &&
+                    device.connectionState.value == ConnectionState.CONNECTED
+                ) {
                     broadcastColorOsBattery(device)
                 }
 
@@ -1838,7 +1992,9 @@ class LibrePodsService: Service() {
 
         when {
             old == EarPresence.NONE -> {
-                if (device.macAddress in audioDisconnectingDevices || pendingAudioReleaseChecks.containsKey(device.macAddress)) {
+                if (device.macAddress !in audioReleasedByLibrePods &&
+                    (device.macAddress in audioDisconnectingDevices || pendingAudioReleaseChecks.containsKey(device.macAddress))
+                ) {
                     Log.d(
                         TAG,
                         "Audio for ${device.macAddress.toRedactedString()} is disconnecting externally; skipping ear-detection audio reconnect"
@@ -1878,9 +2034,11 @@ class LibrePodsService: Service() {
                         TAG,
                         "Disconnecting audio for device ${device.macAddress.toRedactedString()} because user took out all components and disconnectWhenNotWearing is true"
                     )
+                    audioYieldedToOtherDevice.remove(device.macAddress)
                     audioReleasedByLibrePods.add(device.macAddress)
                     device.disableAudio()
                     device.disconnectAudio()
+                    scheduleRestoreSpeakerVolume()
                 }
             }
         }
