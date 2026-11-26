@@ -22,8 +22,14 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.ShortcutInfo
 import android.content.pm.ShortcutManager
+import android.graphics.Bitmap
+import android.graphics.Canvas
+import android.graphics.Color
+import android.graphics.PorterDuff
+import android.graphics.PorterDuffColorFilter
 import android.graphics.drawable.Icon
 import android.util.Log
+import androidx.core.content.ContextCompat
 import me.kavishdevar.librepods.R
 import me.kavishdevar.librepods.core.devices.AirPodsSpecs
 import me.kavishdevar.librepods.core.devices.AppleDevice
@@ -52,6 +58,7 @@ object AppShortcutsManager {
         }
 
         val signature = buildString {
+            append("v2:")
             if (connected != null) {
                 val meta = connected.metadata.value
                 append("connected:")
@@ -126,7 +133,7 @@ object AppShortcutsManager {
                 ShortcutInfo.Builder(context, "disconnect_${mac.replace(":", "")}")
                     .setShortLabel(context.getString(R.string.disconnect))
                     .setLongLabel("${context.getString(R.string.disconnect)} $name")
-                    .setIcon(Icon.createWithResource(context, R.drawable.ic_airpods))
+                    .setIcon(createShortcutIcon(context, R.drawable.ic_airpods))
                     .setRank(shortcuts.size)
                     .setIntent(
                         Intent(context, ShortcutActionActivity::class.java).apply {
@@ -150,7 +157,7 @@ object AppShortcutsManager {
                     ShortcutInfo.Builder(context, "connect_${mac.replace(":", "")}")
                         .setShortLabel(shortLabel)
                         .setLongLabel("${context.getString(R.string.connect)} $name")
-                        .setIcon(Icon.createWithResource(context, R.drawable.ic_airpods))
+                        .setIcon(createShortcutIcon(context, R.drawable.ic_airpods))
                         .setRank(shortcuts.size)
                         .setIntent(
                             Intent(context, ShortcutActionActivity::class.java).apply {
@@ -186,7 +193,7 @@ object AppShortcutsManager {
         return ShortcutInfo.Builder(context, id)
             .setShortLabel(label)
             .setLongLabel(label)
-            .setIcon(Icon.createWithResource(context, iconRes))
+            .setIcon(createShortcutIcon(context, iconRes))
             .setRank(rank)
             .setIntent(
                 Intent(context, ShortcutActionActivity::class.java).apply {
@@ -204,7 +211,7 @@ object AppShortcutsManager {
         return ShortcutInfo.Builder(context, "toggle_listening_mode")
             .setShortLabel(label)
             .setLongLabel(label)
-            .setIcon(Icon.createWithResource(context, R.drawable.ic_noise_cancellation))
+            .setIcon(createShortcutIcon(context, R.drawable.ic_noise_cancellation))
             .setRank(rank)
             .setIntent(
                 Intent(context, ToggleListeningModeActivity::class.java).apply {
@@ -212,5 +219,35 @@ object AppShortcutsManager {
                 }
             )
             .build()
+    }
+
+    /**
+     * Renders a consistently tinted adaptive shortcut icon so vector drawables (like ic_airpods)
+     * and raster PNG drawables (like ic_noise_cancellation) share the exact same color, padding,
+     * and background badge in the launcher shortcut sheet.
+     */
+    private fun createShortcutIcon(context: Context, iconRes: Int): Icon {
+        val drawable = ContextCompat.getDrawable(context, iconRes)?.mutate()
+            ?: return Icon.createWithResource(context, iconRes)
+
+        val canvasSize = 108
+        val maxGlyphSize = 48
+        val bitmap = Bitmap.createBitmap(canvasSize, canvasSize, Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(bitmap)
+        canvas.drawColor(Color.parseColor("#1C222A"))
+
+        val intrinsicW = drawable.intrinsicWidth.takeIf { it > 0 } ?: maxGlyphSize
+        val intrinsicH = drawable.intrinsicHeight.takeIf { it > 0 } ?: maxGlyphSize
+        val scale = minOf(maxGlyphSize.toFloat() / intrinsicW, maxGlyphSize.toFloat() / intrinsicH)
+        val drawW = (intrinsicW * scale).toInt().coerceAtLeast(1)
+        val drawH = (intrinsicH * scale).toInt().coerceAtLeast(1)
+        val left = (canvasSize - drawW) / 2
+        val top = (canvasSize - drawH) / 2
+
+        drawable.colorFilter = PorterDuffColorFilter(Color.WHITE, PorterDuff.Mode.SRC_IN)
+        drawable.setBounds(left, top, left + drawW, top + drawH)
+        drawable.draw(canvas)
+
+        return Icon.createWithAdaptiveBitmap(bitmap)
     }
 }
