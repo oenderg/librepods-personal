@@ -468,4 +468,12 @@
     <string name="listening_mode_shortcut_description">The \"Toggle listening mode\" app shortcut switches between two listening modes. Add it from your launcher, an automation app, or a button mapping app.</string>
     <string name="takeover_non_media_session_audio">Switch audio for games &amp; social apps</string>
     <string name="takeover_non_media_session_audio_description">Automatically switch AirPods to this phone for games, Instagram/Reels, and browser audio without a media session.</string>
+    <string name="open_app">Open LibrePods</string>
+    <string name="qs_tile_behavior">Quick Settings tile action</string>
+    <string name="qs_tile_behavior_dialog">Open listening mode dialog</string>
+    <string name="qs_tile_behavior_cycle_all">Cycle all available modes</string>
+    <string name="qs_tile_behavior_cycle_selected">Cycle selected modes</string>
+    <string name="qs_tile_cycle_modes_title">Modes to cycle</string>
+    <string name="notification_mode_buttons">Notification mode buttons</string>
+    <string name="notification_mode_buttons_description">Show listening mode action buttons in the persistent device notification.</string>
 </resources>

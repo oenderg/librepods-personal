@@ -36,28 +36,9 @@ import android.util.Log
 import android.view.Window
 import android.view.WindowManager
 import androidx.compose.foundation.isSystemInDarkTheme
-import androidx.compose.foundation.layout.Arrangement
-import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.Spacer
-import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.Surface
-import androidx.compose.material3.Text
-import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
-import androidx.compose.runtime.getValue
-import androidx.compose.ui.Alignment
-import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.ComposeView
 import androidx.compose.ui.platform.ViewCompositionStrategy
-import androidx.compose.ui.res.stringResource
-import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.style.TextOverflow
-import androidx.compose.ui.unit.dp
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleOwner
 import androidx.lifecycle.LifecycleRegistry
@@ -80,22 +61,14 @@ import kotlinx.coroutines.launch
 import me.kavishdevar.librepods.LibrePodsApplication
 import me.kavishdevar.librepods.R
 import me.kavishdevar.librepods.core.bluetooth.aacp.types.ControlCommandIdentifier
-import me.kavishdevar.librepods.core.devices.AirPodsSpecs
 import me.kavishdevar.librepods.core.devices.AppleDevice
-import me.kavishdevar.librepods.core.devices.BaseCapability
-import me.kavishdevar.librepods.core.devices.BatteryComponent
 import me.kavishdevar.librepods.core.devices.ConnectionState
 import me.kavishdevar.librepods.core.devices.NoiseControlMode
-import me.kavishdevar.librepods.data.app.ColorStyle
 import me.kavishdevar.librepods.data.app.Design
-import me.kavishdevar.librepods.data.app.DesignSystem
 import me.kavishdevar.librepods.data.app.NightTheme
 import me.kavishdevar.librepods.presentation.activities.MainActivity
-import me.kavishdevar.librepods.presentation.components.apple.NoiseControlSettings
-import me.kavishdevar.librepods.presentation.components.primitives.StyledList
-import me.kavishdevar.librepods.presentation.components.primitives.styledToggle
+import me.kavishdevar.librepods.presentation.components.apple.ListeningModeDialogContent
 import me.kavishdevar.librepods.presentation.design.LibrePodsTheme
-import me.kavishdevar.librepods.presentation.design.LocalDesign
 import kotlin.io.encoding.ExperimentalEncodingApi
 
 class AirPodsQSService : TileService() {
@@ -198,7 +171,12 @@ class AirPodsQSService : TileService() {
             return
         }
 
-        showListeningModeDialog()
+        val prefs = getSharedPreferences("settings", MODE_PRIVATE)
+        when (prefs.getString(PREF_QS_TILE_BEHAVIOR, BEHAVIOR_DIALOG)) {
+            BEHAVIOR_CYCLE_ALL -> cycleAncMode(selectedOnly = false)
+            BEHAVIOR_CYCLE_SELECTED -> cycleAncMode(selectedOnly = true)
+            else -> showListeningModeDialog()
+        }
     }
 
     private fun dismissActiveDialog() {
@@ -258,7 +236,7 @@ class AirPodsQSService : TileService() {
                         ?: me.kavishdevar.librepods.data.app.FontSettings(),
                     darkTheme = darkTheme
                 ) {
-                    QSListeningModeDialogContent(
+                    ListeningModeDialogContent(
                         device = device,
                         onModeSelected = { newMode ->
                             currentAncMode = newMode
@@ -285,6 +263,10 @@ class AirPodsQSService : TileService() {
                                     enabled
                                 )
                             }
+                        },
+                        onOpenApp = {
+                            dismissActiveDialog()
+                            launchMainActivity()
                         }
                     )
                 }
@@ -369,10 +351,10 @@ class AirPodsQSService : TileService() {
         }
     }
 
-    private fun cycleAncMode() {
+    private fun cycleAncMode(selectedOnly: Boolean = false) {
         val device = currentDevice ?: return
-        val nextMode = getNextAncMode()
-        Log.d(TAG, "Cycling ANC mode from $currentAncMode to $nextMode")
+        val nextMode = getNextAncMode(selectedOnly)
+        Log.d(TAG, "Cycling ANC mode from $currentAncMode to $nextMode (selectedOnly=$selectedOnly)")
         CoroutineScope(Dispatchers.IO).launch {
             device.setControlCommand(
                 ControlCommandIdentifier.LISTENING_MODE,
@@ -405,20 +387,38 @@ class AirPodsQSService : TileService() {
         }
     }
 
-    private fun getAvailableModes(): List<Int> {
-        val modes = mutableListOf(
+    private fun getAvailableModes(selectedOnly: Boolean = false): List<Int> {
+        val all = mutableListOf(
             NoiseControlMode.TRANSPARENCY.ordinal + 1,
             NoiseControlMode.ADAPTIVE.ordinal + 1,
             NoiseControlMode.NOISE_CANCELLATION.ordinal + 1
         )
         if (allowOffMode) {
-            modes.add(0, NoiseControlMode.OFF.ordinal + 1)
+            all.add(0, NoiseControlMode.OFF.ordinal + 1)
         }
-        return modes
+        if (!selectedOnly) return all
+
+        val prefs = getSharedPreferences("settings", MODE_PRIVATE)
+        val deviceMask = currentDevice?.state?.value
+            ?.controlStates?.get(ControlCommandIdentifier.LISTENING_MODE_CONFIGS)
+            ?.getOrNull(0)?.toInt() ?: DEFAULT_CYCLE_MODES_MASK
+        val mask = prefs.getInt(PREF_QS_TILE_CYCLE_MODES, deviceMask)
+
+        val filtered = all.filter { mode ->
+            val bit = when (mode) {
+                NoiseControlMode.OFF.ordinal + 1 -> MODE_BIT_OFF
+                NoiseControlMode.NOISE_CANCELLATION.ordinal + 1 -> MODE_BIT_ANC
+                NoiseControlMode.TRANSPARENCY.ordinal + 1 -> MODE_BIT_TRANSPARENCY
+                NoiseControlMode.ADAPTIVE.ordinal + 1 -> MODE_BIT_ADAPTIVE
+                else -> 0
+            }
+            (mask and bit) != 0
+        }
+        return if (filtered.size >= 2) filtered else all
     }
 
-    private fun getNextAncMode(): Int {
-        val availableModes = getAvailableModes()
+    private fun getNextAncMode(selectedOnly: Boolean = false): Int {
+        val availableModes = getAvailableModes(selectedOnly)
         val currentIndex = availableModes.indexOf(currentAncMode)
         val nextIndex = (currentIndex + 1) % availableModes.size
         return availableModes[nextIndex]
@@ -452,119 +452,19 @@ class AirPodsQSService : TileService() {
     companion object {
         private const val TAG = "AirPodsQSService"
         private const val RECONNECT_TIMEOUT_MS = 6_000L
-    }
-}
 
-@Composable
-private fun QSListeningModeDialogContent(
-    device: AppleDevice,
-    onModeSelected: (Int) -> Unit,
-    onAdaptiveStrengthChanged: (Int) -> Unit,
-    onConversationAwarenessChanged: (Boolean) -> Unit
-) {
-    val state by device.state.collectAsState()
-    val metadata by device.metadata.collectAsState()
+        const val PREF_QS_TILE_BEHAVIOR = "qs_tile_behavior"
+        const val PREF_QS_TILE_CYCLE_MODES = "qs_tile_cycle_modes"
 
-    val spec = AirPodsSpecs.getSpec(metadata.model)
-    val conversationAwarenessCapability =
-        spec.baseCapabilities.contains(BaseCapability.CONVERSATION_AWARENESS)
-    val showOffListeningMode =
-        state.controlStates[ControlCommandIdentifier.ALLOW_OFF_OPTION]?.getOrNull(0)?.toInt() == 1
-    val listeningModeValue =
-        state.controlStates[ControlCommandIdentifier.LISTENING_MODE]?.getOrNull(0)?.toInt() ?: 2
-    val adaptiveStrength =
-        state.controlStates[ControlCommandIdentifier.AUTO_ANC_STRENGTH]?.getOrNull(0)?.toInt() ?: 50
-    val conversationAwarenessChecked =
-        state.controlStates[ControlCommandIdentifier.CONVERSATION_DETECT_CONFIG]?.getOrNull(0) == 0x01.toByte()
+        const val BEHAVIOR_DIALOG = "dialog"
+        const val BEHAVIOR_CYCLE_ALL = "cycle_all"
+        const val BEHAVIOR_CYCLE_SELECTED = "cycle_selected"
 
-    val budBatteries = state.battery
-        .filter { it.component == BatteryComponent.LEFT || it.component == BatteryComponent.RIGHT }
-        .mapNotNull { it.level.takeIf { lvl -> lvl in 1..100 } }
-
-    val design = LocalDesign.current
-    val dialogContainerColor = when (design.system) {
-        DesignSystem.Apple -> if (design.colorStyle == ColorStyle.Custom) {
-            MaterialTheme.colorScheme.surface
-        } else {
-            MaterialTheme.colorScheme.surfaceContainer
-        }
-        DesignSystem.Material -> MaterialTheme.colorScheme.surfaceContainer
-    }
-    val badgeContainerColor = MaterialTheme.colorScheme.surfaceContainerHigh
-
-    Surface(
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(horizontal = 12.dp),
-        shape = RoundedCornerShape(28.dp),
-        color = dialogContainerColor,
-        tonalElevation = if (design.system == DesignSystem.Material) 2.dp else 0.dp
-    ) {
-        Column(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(horizontal = 14.dp, vertical = 16.dp)
-        ) {
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(horizontal = 4.dp),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Text(
-                    text = metadata.name.ifBlank { "AirPods" },
-                    style = MaterialTheme.typography.titleMedium,
-                    fontWeight = FontWeight.SemiBold,
-                    color = MaterialTheme.colorScheme.onSurface,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                    modifier = Modifier.weight(1f)
-                )
-
-                if (budBatteries.isNotEmpty()) {
-                    Surface(
-                        shape = RoundedCornerShape(12.dp),
-                        color = badgeContainerColor
-                    ) {
-                        Text(
-                            text = "${budBatteries.min()}%",
-                            style = MaterialTheme.typography.labelMedium,
-                            fontWeight = FontWeight.SemiBold,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp)
-                        )
-                    }
-                }
-            }
-
-            Spacer(modifier = Modifier.height(14.dp))
-
-            NoiseControlSettings(
-                modifier = if (design.system == DesignSystem.Apple) {
-                    Modifier.fillMaxWidth().height(100.dp)
-                } else {
-                    Modifier.fillMaxWidth()
-                },
-                showOffListeningMode = showOffListeningMode,
-                noiseControlModeValue = listeningModeValue,
-                onNoiseControlModeChanged = onModeSelected,
-                adaptiveStrength = adaptiveStrength,
-                onAdaptiveStrengthChanged = onAdaptiveStrengthChanged,
-                showLabels = true
-            )
-
-            if (conversationAwarenessCapability) {
-                Spacer(modifier = Modifier.height(12.dp))
-                StyledList {
-                    styledToggle(
-                        label = stringResource(R.string.conversation_awareness),
-                        checked = conversationAwarenessChecked,
-                        onCheckedChange = onConversationAwarenessChanged
-                    )
-                }
-            }
-        }
+        const val MODE_BIT_OFF = 0x01
+        const val MODE_BIT_ANC = 0x02
+        const val MODE_BIT_TRANSPARENCY = 0x04
+        const val MODE_BIT_ADAPTIVE = 0x08
+        const val DEFAULT_CYCLE_MODES_MASK = MODE_BIT_ANC or MODE_BIT_TRANSPARENCY or MODE_BIT_ADAPTIVE
     }
 }
 

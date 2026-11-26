@@ -31,6 +31,7 @@ import android.graphics.drawable.Icon
 import android.util.Log
 import androidx.core.content.ContextCompat
 import me.kavishdevar.librepods.R
+import me.kavishdevar.librepods.core.bluetooth.aacp.types.ControlCommandIdentifier
 import me.kavishdevar.librepods.core.devices.AirPodsSpecs
 import me.kavishdevar.librepods.core.devices.AppleDevice
 import me.kavishdevar.librepods.core.devices.BaseCapability
@@ -57,6 +58,10 @@ object AppShortcutsManager {
             it.connectionState.value == ConnectionState.CONNECTED
         }
 
+        val allowOff = connected?.state?.value
+            ?.controlStates?.get(ControlCommandIdentifier.ALLOW_OFF_OPTION)
+            ?.getOrNull(0)?.toInt() == 1
+
         val signature = buildString {
             append("v2:")
             if (connected != null) {
@@ -67,6 +72,8 @@ object AppShortcutsManager {
                 append(meta.model.name)
                 append(':')
                 append(meta.name)
+                append(":off=")
+                append(allowOff)
             } else {
                 append("disconnected:")
                 appleDevices.forEach { dev ->
@@ -124,7 +131,19 @@ object AppShortcutsManager {
                         rank = shortcuts.size
                     )
                 )
-                if (!caps.contains(BaseCapability.ADAPTIVE_AUDIO)) {
+                if (allowOff) {
+                    shortcuts.add(
+                        modeShortcut(
+                            context = context,
+                            id = "mode_off",
+                            label = context.getString(R.string.off),
+                            iconRes = R.drawable.ic_noise_cancellation,
+                            mode = NoiseControlMode.OFF.ordinal + 1,
+                            mac = mac,
+                            rank = shortcuts.size
+                        )
+                    )
+                } else if (!caps.contains(BaseCapability.ADAPTIVE_AUDIO)) {
                     shortcuts.add(toggleModeShortcut(context, rank = shortcuts.size))
                 }
             }

@@ -80,6 +80,8 @@ import me.kavishdevar.librepods.presentation.components.primitives.styledListIte
 import me.kavishdevar.librepods.presentation.components.primitives.styledToggle
 import me.kavishdevar.librepods.presentation.icons.LocalIcons
 import me.kavishdevar.librepods.presentation.viewmodel.AppSettingsViewModel
+import me.kavishdevar.librepods.services.AirPodsQSService
+import me.kavishdevar.librepods.services.LibrePodsService
 import me.kavishdevar.librepods.utils.MediaController
 import me.kavishdevar.librepods.utils.XposedState
 import java.util.concurrent.TimeUnit
@@ -110,6 +112,28 @@ fun AppSettingsScreen(
             settingsPrefs.getBoolean(MediaController.PREF_TAKEOVER_NON_MEDIA_SESSION_AUDIO, false)
         )
     }
+    val notificationModeButtons = remember(settingsPrefs) {
+        mutableStateOf(
+            settingsPrefs.getBoolean(LibrePodsService.PREF_NOTIFICATION_MODE_BUTTONS, true)
+        )
+    }
+    val qsTileBehavior = remember(settingsPrefs) {
+        mutableStateOf(
+            settingsPrefs.getString(
+                AirPodsQSService.PREF_QS_TILE_BEHAVIOR,
+                AirPodsQSService.BEHAVIOR_DIALOG
+            ) ?: AirPodsQSService.BEHAVIOR_DIALOG
+        )
+    }
+    val qsTileCycleModes = remember(settingsPrefs) {
+        mutableStateOf(
+            settingsPrefs.getInt(
+                AirPodsQSService.PREF_QS_TILE_CYCLE_MODES,
+                AirPodsQSService.DEFAULT_CYCLE_MODES_MASK
+            )
+        )
+    }
+    val qsTileBehaviorSheet = remember { mutableStateOf(false) }
 
     val backdrop = rememberLayerBackdrop()
 
@@ -220,6 +244,31 @@ fun AppSettingsScreen(
                                 .putBoolean(MediaController.PREF_TAKEOVER_NON_MEDIA_SESSION_AUDIO, checked)
                                 .apply()
                         }
+                    )
+
+                    styledToggle(
+                        label = stringResource(R.string.notification_mode_buttons),
+                        description = stringResource(R.string.notification_mode_buttons_description),
+                        checked = notificationModeButtons.value,
+                        onCheckedChange = { checked ->
+                            notificationModeButtons.value = checked
+                            settingsPrefs.edit()
+                                .putBoolean(LibrePodsService.PREF_NOTIFICATION_MODE_BUTTONS, checked)
+                                .apply()
+                            LibrePodsService.instance?.refreshDeviceNotifications()
+                        }
+                    )
+
+                    val qsBehaviorLabel = when (qsTileBehavior.value) {
+                        AirPodsQSService.BEHAVIOR_CYCLE_ALL -> stringResource(R.string.qs_tile_behavior_cycle_all)
+                        AirPodsQSService.BEHAVIOR_CYCLE_SELECTED -> stringResource(R.string.qs_tile_behavior_cycle_selected)
+                        else -> stringResource(R.string.qs_tile_behavior_dialog)
+                    }
+                    styledListItem(
+                        contentText = stringResource(R.string.qs_tile_behavior),
+                        supportingText = qsBehaviorLabel,
+                        orientation = StyledListItemOrientation.Vertical,
+                        onClick = { qsTileBehaviorSheet.value = true }
                     )
                 }
             }
@@ -573,6 +622,100 @@ fun AppSettingsScreen(
                singleLine = false,
                forceApple = true
            )
+        }
+    }
+
+    StyledBottomSheet(
+        visible = qsTileBehaviorSheet.value,
+        onDismiss = { qsTileBehaviorSheet.value = false },
+        backdrop = backdrop
+    ) { _, progress ->
+        val animatedPadding = lerp(16.dp, 2.dp, progress)
+        fun toggleCycleMode(bit: Int) {
+            val current = qsTileCycleModes.value
+            val updated = if ((current and bit) != 0) {
+                val candidate = current and bit.inv()
+                if (Integer.bitCount(candidate and 0x0F) >= 2) candidate else current
+            } else {
+                current or bit
+            }
+            qsTileCycleModes.value = updated
+            settingsPrefs.edit()
+                .putInt(AirPodsQSService.PREF_QS_TILE_CYCLE_MODES, updated)
+                .apply()
+        }
+
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = animatedPadding)
+                .padding(bottom = 24.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            Text(
+                text = stringResource(R.string.qs_tile_behavior),
+                style = MaterialTheme.typography.titleMedium,
+                color = MaterialTheme.colorScheme.onBackground,
+                modifier = Modifier.padding(horizontal = 4.dp)
+            )
+
+            StyledList {
+                styledToggle(
+                    label = stringResource(R.string.qs_tile_behavior_dialog),
+                    checked = qsTileBehavior.value == AirPodsQSService.BEHAVIOR_DIALOG,
+                    onCheckedChange = {
+                        qsTileBehavior.value = AirPodsQSService.BEHAVIOR_DIALOG
+                        settingsPrefs.edit()
+                            .putString(AirPodsQSService.PREF_QS_TILE_BEHAVIOR, AirPodsQSService.BEHAVIOR_DIALOG)
+                            .apply()
+                    }
+                )
+                styledToggle(
+                    label = stringResource(R.string.qs_tile_behavior_cycle_all),
+                    checked = qsTileBehavior.value == AirPodsQSService.BEHAVIOR_CYCLE_ALL,
+                    onCheckedChange = {
+                        qsTileBehavior.value = AirPodsQSService.BEHAVIOR_CYCLE_ALL
+                        settingsPrefs.edit()
+                            .putString(AirPodsQSService.PREF_QS_TILE_BEHAVIOR, AirPodsQSService.BEHAVIOR_CYCLE_ALL)
+                            .apply()
+                    }
+                )
+                styledToggle(
+                    label = stringResource(R.string.qs_tile_behavior_cycle_selected),
+                    checked = qsTileBehavior.value == AirPodsQSService.BEHAVIOR_CYCLE_SELECTED,
+                    onCheckedChange = {
+                        qsTileBehavior.value = AirPodsQSService.BEHAVIOR_CYCLE_SELECTED
+                        settingsPrefs.edit()
+                            .putString(AirPodsQSService.PREF_QS_TILE_BEHAVIOR, AirPodsQSService.BEHAVIOR_CYCLE_SELECTED)
+                            .apply()
+                    }
+                )
+            }
+
+            if (qsTileBehavior.value == AirPodsQSService.BEHAVIOR_CYCLE_SELECTED) {
+                StyledList(title = stringResource(R.string.qs_tile_cycle_modes_title)) {
+                    styledToggle(
+                        label = stringResource(R.string.off),
+                        checked = (qsTileCycleModes.value and AirPodsQSService.MODE_BIT_OFF) != 0,
+                        onCheckedChange = { toggleCycleMode(AirPodsQSService.MODE_BIT_OFF) }
+                    )
+                    styledToggle(
+                        label = stringResource(R.string.transparency),
+                        checked = (qsTileCycleModes.value and AirPodsQSService.MODE_BIT_TRANSPARENCY) != 0,
+                        onCheckedChange = { toggleCycleMode(AirPodsQSService.MODE_BIT_TRANSPARENCY) }
+                    )
+                    styledToggle(
+                        label = stringResource(R.string.adaptive),
+                        checked = (qsTileCycleModes.value and AirPodsQSService.MODE_BIT_ADAPTIVE) != 0,
+                        onCheckedChange = { toggleCycleMode(AirPodsQSService.MODE_BIT_ADAPTIVE) }
+                    )
+                    styledToggle(
+                        label = stringResource(R.string.noise_cancellation),
+                        checked = (qsTileCycleModes.value and AirPodsQSService.MODE_BIT_ANC) != 0,
+                        onCheckedChange = { toggleCycleMode(AirPodsQSService.MODE_BIT_ANC) }
+                    )
+                }
+            }
         }
     }
 }

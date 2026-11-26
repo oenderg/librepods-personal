@@ -18,7 +18,17 @@
 
 package me.kavishdevar.librepods.presentation.widgets
 
+import android.appwidget.AppWidgetManager
 import android.appwidget.AppWidgetProvider
-import kotlin.io.encoding.ExperimentalEncodingApi
+import android.content.Context
+import me.kavishdevar.librepods.services.LibrePodsService
 
-class BatteryWidget : AppWidgetProvider()
+class BatteryWidget : AppWidgetProvider() {
+    override fun onUpdate(
+        context: Context,
+        appWidgetManager: AppWidgetManager,
+        appWidgetIds: IntArray
+    ) {
+        LibrePodsService.instance?.updateWidgets()
+    }
+}

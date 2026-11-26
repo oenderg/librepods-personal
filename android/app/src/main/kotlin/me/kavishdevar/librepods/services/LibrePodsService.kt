@@ -83,6 +83,7 @@ import me.kavishdevar.librepods.presentation.overlays.IslandType
 import me.kavishdevar.librepods.presentation.overlays.IslandWindow
 import me.kavishdevar.librepods.presentation.overlays.ProximityCardWindow
 import me.kavishdevar.librepods.presentation.widgets.BatteryWidget
+import me.kavishdevar.librepods.presentation.widgets.NoiseControlWidget
 import me.kavishdevar.librepods.utils.AppShortcutsManager
 import me.kavishdevar.librepods.utils.MediaController
 import me.kavishdevar.librepods.utils.calculateLevel
@@ -102,6 +103,8 @@ private const val AUDIO_RELEASE_GRACE_MS = 3_000L
 @SuppressLint("MissingPermission")
 class LibrePodsService: Service() {
     companion object {
+        const val PREF_NOTIFICATION_MODE_BUTTONS = "notification_mode_buttons"
+
         @Volatile
         var instance: LibrePodsService? = null
             private set
@@ -371,7 +374,13 @@ class LibrePodsService: Service() {
                 if (appleDevices.isEmpty()) return@collectLatest
 
                 val flows = appleDevices.map { dev ->
-                    combine(dev.connectionState, dev.metadata) { conn, meta -> conn to meta }
+                    combine(dev.connectionState, dev.metadata, dev.state) { conn, meta, st ->
+                        Triple(
+                            conn,
+                            meta,
+                            st.controlStates[ControlCommandIdentifier.ALLOW_OFF_OPTION]?.getOrNull(0)?.toInt() == 1
+                        )
+                    }
                 }
                 combine(flows) { it }.collectLatest {
                     AppShortcutsManager.update(this@LibrePodsService, list)
@@ -998,6 +1007,9 @@ class LibrePodsService: Service() {
                     }
                 }
 
+                if (previousConnectionState != state) {
+                    updateWidgets()
+                }
                 previousConnectionState = state
             }
         }
@@ -1241,6 +1253,7 @@ class LibrePodsService: Service() {
 
                         Log.d(TAG, "updating notification")
                         updateDeviceNotification(device = device)
+                        updateWidgets()
                     }
 
                     state.controlStates != previousState.controlStates -> {
@@ -1256,6 +1269,7 @@ class LibrePodsService: Service() {
 
                         Log.d(TAG, "updating notification")
                         updateDeviceNotification(device = device)
+                        updateWidgets()
                     }
 
                     state.conversationAwarenessState != previousState.conversationAwarenessState -> {
@@ -1500,6 +1514,10 @@ class LibrePodsService: Service() {
         }
     }
 
+    fun refreshDeviceNotifications() {
+        devices.value.values.forEach { updateDeviceNotification(it) }
+    }
+
     fun updateDeviceNotification(
         device: Device<*, *, *>
     ) {
@@ -1533,65 +1551,69 @@ class LibrePodsService: Service() {
                             .setPriority(NotificationCompat.PRIORITY_LOW)
                             .setOngoing(true)
                     if (device.connectionState.value == ConnectionState.CONNECTED) {
-                        if (device.state.value.controlStates[ControlCommandIdentifier.ALLOW_OFF_OPTION]?.getOrNull(0) == 0x01.toByte()) {
-                            updatedNotificationBuilder.addAction(
-                                R.drawable.ic_noise_cancellation,
-                                getString(R.string.off),
-                                PendingIntent.getService(
-                                    this,
-                                    notificationId + 1,
-                                    Intent(this, LibrePodsService::class.java).apply {
-                                        action = LibrePodsIntents.ACTION_SET_ANC_MODE
-                                        putExtra(LibrePodsIntents.Extras.MAC_ADDRESS, device.macAddress.toString())
-                                        putExtra(LibrePodsIntents.Extras.ANC_MODE, 1)
-                                    },
-                                    PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-                                ),
-                            )
+                        val showModeButtons = getSharedPreferences("settings", MODE_PRIVATE)
+                            .getBoolean(PREF_NOTIFICATION_MODE_BUTTONS, true)
+                        if (showModeButtons) {
+                            if (device.state.value.controlStates[ControlCommandIdentifier.ALLOW_OFF_OPTION]?.getOrNull(0) == 0x01.toByte()) {
+                                updatedNotificationBuilder.addAction(
+                                    R.drawable.ic_noise_cancellation,
+                                    getString(R.string.off),
+                                    PendingIntent.getService(
+                                        this,
+                                        notificationId + 1,
+                                        Intent(this, LibrePodsService::class.java).apply {
+                                            action = LibrePodsIntents.ACTION_SET_ANC_MODE
+                                            putExtra(LibrePodsIntents.Extras.MAC_ADDRESS, device.macAddress.toString())
+                                            putExtra(LibrePodsIntents.Extras.ANC_MODE, 1)
+                                        },
+                                        PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+                                    ),
+                                )
+                            }
+                            updatedNotificationBuilder
+                                .addAction(
+                                    R.drawable.ic_transparency, // icon never shows up?? (tested on AOSP ROMs)
+                                    getString(R.string.transparency),
+                                    PendingIntent.getService(
+                                        this,
+                                        notificationId + 3,
+                                        Intent(this, LibrePodsService::class.java).apply {
+                                            action = LibrePodsIntents.ACTION_SET_ANC_MODE
+                                            putExtra(LibrePodsIntents.Extras.MAC_ADDRESS, device.macAddress.toString())
+                                            putExtra(LibrePodsIntents.Extras.ANC_MODE, 3)
+                                        },
+                                        PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+                                    ),
+                                )
+                                .addAction(
+                                    R.drawable.ic_adaptive,
+                                    getString(R.string.adaptive),
+                                    PendingIntent.getService(
+                                        this,
+                                        notificationId + 4,
+                                        Intent(this, LibrePodsService::class.java).apply {
+                                            action = LibrePodsIntents.ACTION_SET_ANC_MODE
+                                            putExtra(LibrePodsIntents.Extras.MAC_ADDRESS, device.macAddress.toString())
+                                            putExtra(LibrePodsIntents.Extras.ANC_MODE, 4)
+                                        },
+                                        PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+                                    ),
+                                )
+                                .addAction(
+                                    R.drawable.ic_noise_cancellation,
+                                    getString(R.string.noise_cancellation),
+                                    PendingIntent.getService(
+                                        this,
+                                        notificationId + 2,
+                                        Intent(this, LibrePodsService::class.java).apply {
+                                            action = LibrePodsIntents.ACTION_SET_ANC_MODE
+                                            putExtra(LibrePodsIntents.Extras.MAC_ADDRESS, device.macAddress.toString())
+                                            putExtra(LibrePodsIntents.Extras.ANC_MODE, 2)
+                                        },
+                                        PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+                                    ),
+                                )
                         }
-                        updatedNotificationBuilder
-                            .addAction(
-                                R.drawable.ic_transparency, // icon never shows up?? (tested on AOSP ROMs)
-                                getString(R.string.transparency),
-                                PendingIntent.getService(
-                                    this,
-                                    notificationId + 3,
-                                    Intent(this, LibrePodsService::class.java).apply {
-                                        action = LibrePodsIntents.ACTION_SET_ANC_MODE
-                                        putExtra(LibrePodsIntents.Extras.MAC_ADDRESS, device.macAddress.toString())
-                                        putExtra(LibrePodsIntents.Extras.ANC_MODE, 3)
-                                    },
-                                    PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-                                ),
-                            )
-                            .addAction(
-                                R.drawable.ic_adaptive,
-                                getString(R.string.adaptive),
-                                PendingIntent.getService(
-                                    this,
-                                    notificationId + 4,
-                                    Intent(this, LibrePodsService::class.java).apply {
-                                        action = LibrePodsIntents.ACTION_SET_ANC_MODE
-                                        putExtra(LibrePodsIntents.Extras.MAC_ADDRESS, device.macAddress.toString())
-                                        putExtra(LibrePodsIntents.Extras.ANC_MODE, 4)
-                                    },
-                                    PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-                                ),
-                            )
-                            .addAction(
-                                R.drawable.ic_noise_cancellation,
-                                getString(R.string.noise_cancellation),
-                                PendingIntent.getService(
-                                    this,
-                                    notificationId + 2,
-                                    Intent(this, LibrePodsService::class.java).apply {
-                                        action = LibrePodsIntents.ACTION_SET_ANC_MODE
-                                        putExtra(LibrePodsIntents.Extras.MAC_ADDRESS, device.macAddress.toString())
-                                        putExtra(LibrePodsIntents.Extras.ANC_MODE, 2)
-                                    },
-                                    PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-                                ),
-                            )
                     } else {
                         updatedNotificationBuilder.addAction(
                             R.drawable.ic_power,
@@ -1749,6 +1771,13 @@ class LibrePodsService: Service() {
             }
         }
         appWidgetManager.updateAppWidget(widgetIds, remoteViews)
+
+        val noiseControlIds = appWidgetManager.getAppWidgetIds(
+            ComponentName(this, NoiseControlWidget::class.java)
+        )
+        if (noiseControlIds.isNotEmpty()) {
+            NoiseControlWidget.updateAppWidgets(this, appWidgetManager, noiseControlIds)
+        }
     }
 
     private fun processComponentStateChange(
