@@ -91,6 +91,7 @@ class IslandWindow(
 
     private var onNoiseControlModeChanged: (Int) -> Unit = { noiseControlModeValue = it }
     private var onAdaptiveStrengthChanged: (Int) -> Unit = { adaptiveStrength = it }
+    private var onReverseAction: () -> Unit = {}
 
     private var openApp: () -> Unit = {}
 
@@ -207,6 +208,7 @@ class IslandWindow(
         this.type = type
         this.reversed = reversed
         this.otherDeviceName = otherDeviceName
+        this.onReverseAction = onReverseAction
 
         this.openApp = openApp
 
@@ -324,6 +326,10 @@ class IslandWindow(
                         islandState = islandState,
 
                         openApp = { openApp() },
+                        onReverseAction = {
+                            this@IslandWindow.onReverseAction()
+                            close()
+                        },
                         changeState = { state, updateBefore ->
                             if (updateBefore) updateWindowParams(state)
                             Log.d("Island", "Changing state: $islandState -> $state")

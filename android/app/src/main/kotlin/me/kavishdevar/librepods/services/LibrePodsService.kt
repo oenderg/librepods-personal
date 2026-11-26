@@ -487,8 +487,9 @@ class LibrePodsService: Service() {
                         "Loaded metadata for device ${device.macAddress.toRedactedString()}: $metadata"
                     )
 
+                    val currentState = device.state.value
                     device.loadInitialState(
-                        state = AppleState().copy(
+                        state = currentState.copy(
                             capabilities = cache.capabilities,
                             magicKeys = cache.magicKeys,
                             controlStates = cache.controlStates,
@@ -567,6 +568,13 @@ class LibrePodsService: Service() {
             setActiveAudioDevice(connectedApple.bluetoothDevice)
         }
 
+        if (wasYielded) {
+            showIsland(
+                device = connectedApple,
+                type = IslandType.TAKING_OVER
+            )
+        }
+
         if (localMac != null && hasOtherPeer) {
             Log.i(TAG, "Smart Routing: claiming ownership & sending hijack request for ${connectedApple.macAddress.toRedactedString()}")
             serviceCoroutineScope.launch {
@@ -594,7 +602,42 @@ class LibrePodsService: Service() {
         }
     }
 
-    private fun yieldOwnershipToOtherDevice(device: AppleDevice, reason: String) {
+    private fun resolvePeerDeviceName(device: AppleDevice, peerMac: String? = null): String {
+        val localMac = getLocalBluetoothMac()
+        val connectedDevices = device.state.value.connectedDevices
+        val targetMac = peerMac
+            ?: device.state.value.audioSource.mac.value.takeIf {
+                it != "00:00:00:00:00:00" && (localMac == null || !it.equals(localMac, ignoreCase = true))
+            }
+        val matched = targetMac?.let { mac ->
+            connectedDevices.find { it.macAddress.value.equals(mac, ignoreCase = true) }
+        } ?: connectedDevices.firstOrNull { peer ->
+            localMac == null || !peer.macAddress.value.equals(localMac, ignoreCase = true)
+        }
+        return matched?.type?.takeIf { it.isNotBlank() } ?: "another device"
+    }
+
+    private fun reverseHandoff(device: AppleDevice) {
+        val localMac = getLocalBluetoothMac()
+        audioYieldedToOtherDevice.remove(device.macAddress)
+        Log.i(TAG, "Smart Routing: user tapped reverse banner; reclaiming ${device.macAddress.toRedactedString()}")
+        setActiveAudioDevice(device.bluetoothDevice)
+        if (localMac != null) {
+            serviceCoroutineScope.launch {
+                device.aacp.sendControlCommand(ControlCommandIdentifier.OWNS_CONNECTION.value, 1)
+                device.aacp.sendMediaInformataion(localMac, streamingState = false)
+                device.aacp.sendSmartRoutingShowUI(localMac)
+                device.aacp.sendHijackReversed(localMac)
+            }
+        }
+    }
+
+    private fun yieldOwnershipToOtherDevice(
+        device: AppleDevice,
+        reason: String,
+        peerMac: String? = null,
+        reversed: Boolean = false
+    ) {
         if (!audioYieldedToOtherDevice.add(device.macAddress)) {
             Log.d(TAG, "Smart Routing: already yielded ${device.macAddress.toRedactedString()} ($reason)")
             return
@@ -603,6 +646,13 @@ class LibrePodsService: Service() {
         device.aacp.sendControlCommand(ControlCommandIdentifier.OWNS_CONNECTION.value, byteArrayOf(0x00))
         MediaController.onOwnershipLost()
         removeActiveAudioDevice()
+        showIsland(
+            device = device,
+            type = IslandType.MOVED_TO_OTHER_DEVICE,
+            reversed = reversed,
+            otherDeviceName = resolvePeerDeviceName(device, peerMac),
+            onReverseAction = { reverseHandoff(device) }
+        )
     }
 
     private fun observeAppleEvents(device: AppleDevice) {
@@ -611,8 +661,10 @@ class LibrePodsService: Service() {
                 when (event) {
                     is me.kavishdevar.librepods.core.bluetooth.aacp.types.AppleEvent.OwnershipToFalseRequest -> {
                         yieldOwnershipToOtherDevice(
-                            device,
-                            "SetOwnershipToFalse from ${event.sender}, reverseTapped=${event.reverseTapped}"
+                            device = device,
+                            reason = "SetOwnershipToFalse from ${event.sender}, reverseTapped=${event.reverseTapped}",
+                            peerMac = event.sender,
+                            reversed = event.reverseTapped
                         )
                     }
                     else -> {}
@@ -898,8 +950,9 @@ class LibrePodsService: Service() {
                         "Loaded metadata for device ${device.macAddress.toRedactedString()}: $metadata"
                     )
 
+                    val currentState = device.state.value
                     device.loadInitialState(
-                        state = AppleState().copy(
+                        state = currentState.copy(
                             capabilities = cache.capabilities,
                             magicKeys = cache.magicKeys,
                             controlStates = cache.controlStates,
@@ -1020,6 +1073,12 @@ class LibrePodsService: Service() {
                                 "Another device (${src.mac.toRedactedString()}, ${src.type}) is using ${device.macAddress.toRedactedString()}; clearing active A2DP device on this phone"
                             )
                             removeActiveAudioDevice()
+                            showIsland(
+                                device = device,
+                                type = IslandType.MOVED_TO_OTHER_DEVICE,
+                                otherDeviceName = resolvePeerDeviceName(device, src.mac.value),
+                                onReverseAction = { reverseHandoff(device) }
+                            )
                         }
                     } else if (
                         src != null &&
@@ -1103,20 +1162,9 @@ class LibrePodsService: Service() {
 
                         if (islandWindow.isVisible) {
                             Log.d(TAG, "updating island window")
-                            val leftBattery = state.battery.find { it.component == BatteryComponent.LEFT }
-                            val rightBattery = state.battery.find { it.component == BatteryComponent.RIGHT }
-
-                            val leftLevel = leftBattery?.level ?: 0
-                            val rightLevel = rightBattery?.level ?: 0
-
-                            val displayBatteryLevel = when {
-                                leftLevel > 0 && rightLevel > 0 -> minOf(leftLevel, rightLevel)
-                                leftLevel > 0 -> leftLevel
-                                rightLevel > 0 -> rightLevel
-                                else -> 0
+                            computeDisplayBatteryLevel(state.battery)?.let { level ->
+                                islandWindow.updateBattery(level)
                             }
-
-                            islandWindow.updateBattery(displayBatteryLevel)
                         }
 
                         if (proximityCardWindow.isVisible) proximityCardWindow.updateBatteries(state.battery)
@@ -1362,11 +1410,23 @@ class LibrePodsService: Service() {
         }
     }
 
+    private fun computeDisplayBatteryLevel(
+        batteries: Set<me.kavishdevar.librepods.core.devices.Battery>
+    ): Int? {
+        val buds = batteries.filter {
+            (it.component == BatteryComponent.LEFT || it.component == BatteryComponent.RIGHT) && it.level > 0
+        }
+        val activeBuds = buds.filter { it.status != BatteryStatus.DISCONNECTED }
+        val candidates = activeBuds.ifEmpty { buds }
+        return candidates.minOfOrNull { it.level }
+    }
+
     fun showIsland(
         device: Device<*, *, *>,
         type: IslandType = IslandType.CONNECTED,
         reversed: Boolean = false,
-        otherDeviceName: String? = null
+        otherDeviceName: String? = null,
+        onReverseAction: () -> Unit = {}
     ) {
         Log.d(TAG, "Showing island window")
 
@@ -1393,9 +1453,7 @@ class LibrePodsService: Service() {
 
                     Log.i(TAG, "Showing island for device ${device.macAddress.toRedactedString()}")
 
-                    val leftBattery = state.battery.find { it.component == BatteryComponent.LEFT }?.level ?: 0
-                    val rightBattery = state.battery.find { it.component == BatteryComponent.RIGHT }?.level ?: 0
-                    val batteryPercentage = leftBattery.coerceAtMost(rightBattery)
+                    val batteryPercentage = computeDisplayBatteryLevel(state.battery) ?: 0
 
                     islandWindow.show(
                         name = metadata.name,
@@ -1403,6 +1461,7 @@ class LibrePodsService: Service() {
                         type = type,
                         reversed = reversed,
                         otherDeviceName = otherDeviceName,
+                        onReverseAction = onReverseAction,
 
                         openApp = {
                             val intent = Intent(

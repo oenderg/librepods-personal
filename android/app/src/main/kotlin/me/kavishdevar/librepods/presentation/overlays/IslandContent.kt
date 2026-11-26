@@ -15,6 +15,7 @@ import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.gestures.detectVerticalDragGestures
 import androidx.compose.foundation.layout.Arrangement
@@ -31,6 +32,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.requiredHeightIn
 import androidx.compose.foundation.layout.requiredSize
 import androidx.compose.foundation.layout.requiredWidth
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
@@ -54,6 +56,7 @@ import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.res.imageResource
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
@@ -85,6 +88,7 @@ fun IslandContent(
     islandState: IslandState,
 
     openApp: () -> Unit = {},
+    onReverseAction: () -> Unit = {},
     changeState: (IslandState, Boolean) -> Unit = { _, _ ->},
     onClosed: () -> Unit = {},
     resetTimer: () -> Unit = {},
@@ -109,10 +113,19 @@ fun IslandContent(
         stiffness = if (islandState == IslandState.CLOSE) Spring.StiffnessMedium else Spring.StiffnessMediumLow
     )
 
+    val showListeningModeRow = islandSettings.showListeningModeControl && type != IslandType.MOVED_TO_OTHER_DEVICE
+    val hiddenControlReductionPx = with(density) {
+        if (islandSettings.showListeningModeControl && !showListeningModeRow) 72.dp.toPx() else 0f
+    }
+    val minBannerHeightPx = with(density) { 80.dp.toPx() }
+    val effectiveExpandedHeight = (islandSettings.expandedHeight - hiddenControlReductionPx)
+        .coerceAtLeast(minBannerHeightPx)
+
     LaunchedEffect(
         islandState,
+        type,
         islandSettings.expandedWidth,
-        islandSettings.expandedHeight,
+        effectiveExpandedHeight,
         islandSettings.compactWidth,
         islandSettings.compactHeight,
         islandSettings.expandedBorderRadius,
@@ -121,7 +134,7 @@ fun IslandContent(
         islandSettings.compactBorderWidth
     ) {
         val (targetW, targetH) = when (islandState) {
-            IslandState.EXPANDED -> islandSettings.expandedWidth to islandSettings.expandedHeight
+            IslandState.EXPANDED -> islandSettings.expandedWidth to effectiveExpandedHeight
             IslandState.COMPACT -> islandSettings.compactWidth to islandSettings.compactHeight
             IslandState.CLOSE -> islandSettings.compactHeight to islandSettings.compactHeight
         }
@@ -198,11 +211,7 @@ fun IslandContent(
             if (otherDeviceName.isNullOrEmpty()) {
                 Log.w("IslandWindow", "Other device name is null or empty for MOVED_TO_OTHER_DEVICE type")
             }
-            if (reversed) {
-                stringResource(R.string.island_moved_to_other_device_reversed_text)
-            } else {
-                stringResource(R.string.island_moved_to_other_device_text, otherDeviceName ?: "")
-            }
+            stringResource(R.string.island_moved_to_other_device_text, otherDeviceName ?: "")
         }
     }
 
@@ -369,78 +378,109 @@ fun IslandContent(
                     IslandState.CLOSE -> islandSettings.compactBatteryStyle
                 }
 
-                val showRing = currentBatteryStyle == OverlayBatteryStyle.CIRCLE || currentBatteryStyle == OverlayBatteryStyle.CIRCLE_TEXT
-                val showText = currentBatteryStyle == OverlayBatteryStyle.TEXT || currentBatteryStyle == OverlayBatteryStyle.CIRCLE_TEXT
+                val isMovedBanner = type == IslandType.MOVED_TO_OTHER_DEVICE
+                val showReverseButton = isMovedBanner
+                val showBattery = !isMovedBanner && batteryLevel > 0
+                val showRing = showBattery && (currentBatteryStyle == OverlayBatteryStyle.CIRCLE || currentBatteryStyle == OverlayBatteryStyle.CIRCLE_TEXT)
+                val showText = showBattery && (currentBatteryStyle == OverlayBatteryStyle.TEXT || currentBatteryStyle == OverlayBatteryStyle.CIRCLE_TEXT)
+                val isDarkTheme = backgroundColor.luminance() < 0.5f
 
-                BoxWithConstraints(
-                    modifier = Modifier
-                        .heightIn(max = 64.dp)
-                        .fillMaxHeight(accessoryHeightFraction)
-                        .aspectRatio(1f),
-                    contentAlignment = Alignment.Center
-                ) {
-                    val isDarkTheme = backgroundColor.luminance() < 0.5f
-                    val batteryColor =
-                        if (batteryLevel > 25) if (isDarkTheme) Color(0xFF2ED158) else Color(0xFF35C759)
-                        else if (isDarkTheme) Color(0xFFFC4244) else Color(0xFFfe373C)
-
-                    this@Row.AnimatedVisibility(
-                        visible = showRing,
-                        enter = fadeIn(animationSpec = tween(180, delayMillis = 80)),
-                        exit = fadeOut(animationSpec = tween(100)),
+                if (showReverseButton) {
+                    val accentBlue = if (isDarkTheme) Color(0xFF0A84FF) else Color(0xFF007AFF)
+                    val buttonBg = accentBlue.copy(alpha = if (isDarkTheme) 0.22f else 0.14f)
+                    Box(
+                        modifier = Modifier
+                            .heightIn(max = 52.dp)
+                            .fillMaxHeight(accessoryHeightFraction)
+                            .aspectRatio(1f)
+                            .clip(CircleShape)
+                            .background(buttonBg, CircleShape)
+                            .clickable(onClick = onReverseAction),
+                        contentAlignment = Alignment.Center
                     ) {
-                        val strokeWidthPx = with(LocalDensity.current) { (maxHeight / 11f).toPx() }
-
-                        val progress = batteryLevel / 100f
-
-                        Canvas(
-                            modifier = Modifier.fillMaxSize()
-                        ) {
-                            val startAngle = -90f
-                            val stroke = Stroke(width = strokeWidthPx, cap = StrokeCap.Round)
-
-                            drawArc(
-                                color = batteryColor.copy(0.2f),
-                                startAngle = 0f,
-                                sweepAngle = 360f,
-                                useCenter = false,
-                                style = stroke
-                            )
-
-                            drawArc(
-                                color = batteryColor,
-                                startAngle = startAngle,
-                                sweepAngle = 360f * progress,
-                                useCenter = false,
-                                style = stroke
-                            )
-                        }
-                    }
-                    this@Row.AnimatedVisibility(
-                        visible = showText,
-                        enter = fadeIn(animationSpec = tween(180, delayMillis = 80)),
-                        exit = fadeOut(animationSpec = tween(100)),
-                    ) {
-                        val fontSize = with(LocalDensity.current) {
-                            (maxHeight / 2.9f).toSp()
-                        }
-                        Text(
-                            text = batteryLevel.toString(),
-                            style = MaterialTheme.typography.bodyLarge.copy(
-                                fontSize = fontSize,
-                                fontWeight = FontWeight.Normal
-                            ),
-                            color = batteryColor,
-                            maxLines = 1,
-                            softWrap = false,
-                            textAlign = TextAlign.Center,
+                        Icon(
+                            painter = painterResource(R.drawable.ic_undo),
+                            contentDescription = stringResource(R.string.undo),
+                            tint = accentBlue,
+                            modifier = Modifier.fillMaxSize(0.56f)
                         )
+                    }
+                } else {
+                    AnimatedVisibility(
+                        visible = showBattery,
+                        enter = fadeIn(animationSpec = tween(180)),
+                        exit = fadeOut(animationSpec = tween(100)),
+                    ) {
+                        BoxWithConstraints(
+                            modifier = Modifier
+                                .heightIn(max = 64.dp)
+                                .fillMaxHeight(accessoryHeightFraction)
+                                .aspectRatio(1f),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            val batteryColor =
+                                if (batteryLevel > 25) if (isDarkTheme) Color(0xFF2ED158) else Color(0xFF35C759)
+                                else if (isDarkTheme) Color(0xFFFC4244) else Color(0xFFfe373C)
+
+                            this@Row.AnimatedVisibility(
+                                visible = showRing,
+                                enter = fadeIn(animationSpec = tween(180, delayMillis = 80)),
+                                exit = fadeOut(animationSpec = tween(100)),
+                            ) {
+                                val strokeWidthPx = with(LocalDensity.current) { (maxHeight / 11f).toPx() }
+
+                                val progress = batteryLevel / 100f
+
+                                Canvas(
+                                    modifier = Modifier.fillMaxSize()
+                                ) {
+                                    val startAngle = -90f
+                                    val stroke = Stroke(width = strokeWidthPx, cap = StrokeCap.Round)
+
+                                    drawArc(
+                                        color = batteryColor.copy(0.2f),
+                                        startAngle = 0f,
+                                        sweepAngle = 360f,
+                                        useCenter = false,
+                                        style = stroke
+                                    )
+
+                                    drawArc(
+                                        color = batteryColor,
+                                        startAngle = startAngle,
+                                        sweepAngle = 360f * progress,
+                                        useCenter = false,
+                                        style = stroke
+                                    )
+                                }
+                            }
+                            this@Row.AnimatedVisibility(
+                                visible = showText,
+                                enter = fadeIn(animationSpec = tween(180, delayMillis = 80)),
+                                exit = fadeOut(animationSpec = tween(100)),
+                            ) {
+                                val fontSize = with(LocalDensity.current) {
+                                    (maxHeight / 2.9f).toSp()
+                                }
+                                Text(
+                                    text = batteryLevel.toString(),
+                                    style = MaterialTheme.typography.bodyLarge.copy(
+                                        fontSize = fontSize,
+                                        fontWeight = FontWeight.Normal
+                                    ),
+                                    color = batteryColor,
+                                    maxLines = 1,
+                                    softWrap = false,
+                                    textAlign = TextAlign.Center,
+                                )
+                            }
+                        }
                     }
                 }
             }
 
             AnimatedVisibility(
-                visible = islandSettings.showListeningModeControl && islandState == IslandState.EXPANDED,
+                visible = showListeningModeRow && islandState == IslandState.EXPANDED,
                 enter = fadeIn(animationSpec = tween(180, delayMillis = 80)),
                 exit = fadeOut(animationSpec = tween(100)),
                 modifier = Modifier
