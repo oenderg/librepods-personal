@@ -84,6 +84,7 @@ import me.kavishdevar.librepods.presentation.overlays.IslandWindow
 import me.kavishdevar.librepods.presentation.overlays.ProximityCardWindow
 import me.kavishdevar.librepods.presentation.widgets.BatteryWidget
 import me.kavishdevar.librepods.presentation.widgets.NoiseControlWidget
+import me.kavishdevar.librepods.presentation.widgets.QuickControlWidget
 import me.kavishdevar.librepods.utils.AppShortcutsManager
 import me.kavishdevar.librepods.utils.MediaController
 import me.kavishdevar.librepods.utils.calculateLevel
@@ -1777,6 +1778,13 @@ class LibrePodsService: Service() {
         )
         if (noiseControlIds.isNotEmpty()) {
             NoiseControlWidget.updateAppWidgets(this, appWidgetManager, noiseControlIds)
+        }
+
+        val quickControlIds = appWidgetManager.getAppWidgetIds(
+            ComponentName(this, QuickControlWidget::class.java)
+        )
+        if (quickControlIds.isNotEmpty()) {
+            QuickControlWidget.updateAppWidgets(this, appWidgetManager, quickControlIds)
         }
     }
 
