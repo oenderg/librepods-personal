@@ -35,4 +35,5 @@ See [`docs/fork/BUILDING.md`](docs/fork/BUILDING.md) for full details. Quick com
 
 ## Rules
 - **No personal data in commits or docs:** Never include real Bluetooth MAC addresses, AirPods serial numbers, or personal device names.
+- **Commit messages:** Use [Conventional Commits](https://www.conventionalcommits.org/): `type(scope): summary` in lowercase imperative, e.g. `fix(android): …`, `feat(core,android): …`, `docs: …`, `ci: …`. Scopes are the modules touched (`android`, `core`). Reference upstream issues/PRs at the end of the summary, e.g. `(#911)` or `(PR #850)`. Put the details in a bulleted body.
 - **Verify changes:** Run `:core:testDebugUnitTest` and `assembleFossDebug` after code edits; verify Bluetooth/UI/LSPosed changes on a real device when possible.
