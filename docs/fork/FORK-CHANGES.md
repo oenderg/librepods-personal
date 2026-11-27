@@ -26,6 +26,9 @@ This document summarizes the fixes and features carried on `oenderg/librepods-pe
   - Scoped ATT reads/polling in `AppleDevice` to a per-connection `CoroutineScope`.
   - Added AACP-only teardown in `LibrePodsService.onDestroy()`, `STATE_DISCONNECTING` guard during external disconnects, and pending A2DP receiver cleanup.
   - Fixed ear-detection / A2DP reconnect race when buds are re-inserted within 3 s of LibrePods releasing audio (`audioReleasedByLibrePods` no longer schedules `pendingAudioReleaseChecks`), plus a media-start A2DP recovery safety net in `restoreYieldedAudioDevice()`.
+- **No speaker blip when inserting one bud:**
+  - With *disconnect when not wearing* on, putting one bud back in sent `KEYCODE_MEDIA_PLAY` before A2DP had reconnected, so playback resumed on the phone speaker for several seconds (upstream behavior too).
+  - Play is now sent immediately only if A2DP is already connected; otherwise it waits for the `waitForA2dpConnection` callback, then for media to leave `TYPE_BUILTIN_SPEAKER` (up to 1.5 s).
 - **`RenamePacket` & `RenameScreen` fix (`4ca583a`):**
   - Fixed 16-bit LE length and UTF-8 byte-length encoding in `RenamePacket` (prevented AirPods firmware crashes/reboots when opening the Rename screen).
   - Skipped sending on screen open/unchanged text and debounced typing by 400 ms.

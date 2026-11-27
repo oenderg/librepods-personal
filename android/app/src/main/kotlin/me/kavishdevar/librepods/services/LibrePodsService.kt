@@ -2120,6 +2120,14 @@ class LibrePodsService: Service() {
                         TAG,
                         "User put in at least one component, enabling audio for device ${device.macAddress.toRedactedString()}"
                     )
+                    // If A2DP isn't up yet (e.g. we released it when the buds came out),
+                    // playing now would start on the phone speaker until A2DP connects.
+                    // In that case only the waitForA2dpConnection callback below sends play.
+                    val a2dpAlreadyConnected = try {
+                        a2dpProxy?.getConnectionState(device.bluetoothDevice) == BluetoothProfile.STATE_CONNECTED
+                    } catch (_: Exception) {
+                        false
+                    }
                     audioReleasedByLibrePods.remove(device.macAddress)
                     device.enableAudio()
                     device.connectA2dp()
@@ -2128,16 +2136,28 @@ class LibrePodsService: Service() {
                     cancelPendingA2dpReceiver(device.macAddress)
                     pendingA2dpReceivers[device.macAddress] = device.waitForA2dpConnection(this) {
                         pendingA2dpReceivers.remove(device.macAddress)
-                        MediaController.sendPlay()
-                        MediaController.iPausedTheMedia = false
+                        // A2DP CONNECTED arrives ~250-400 ms before AudioPolicy moves media
+                        // off the speaker; wait for the route (max 1.5 s) so play doesn't blip.
+                        serviceCoroutineScope.launch(Dispatchers.Main) {
+                            var waitedMs = 0
+                            while (isMediaRoutedToSpeaker() && waitedMs < 1_500) {
+                                delay(50)
+                                waitedMs += 50
+                            }
+                            Log.d(TAG, "A2DP connected; sending deferred play after ${waitedMs}ms route wait")
+                            MediaController.sendPlay()
+                            MediaController.iPausedTheMedia = false
+                        }
                     }
 
                     if (MediaController.getMusicActive()) {
                         MediaController.userPlayedTheMedia = true
                     }
-                    if (new == EarPresence.PARTIAL) {
+                    if (new == EarPresence.PARTIAL && a2dpAlreadyConnected) {
                         MediaController.sendPlay()
                         MediaController.iPausedTheMedia = false
+                    } else if (new == EarPresence.PARTIAL) {
+                        Log.d(TAG, "A2DP not connected yet; deferring play until it connects")
                     }
                 }
             }
